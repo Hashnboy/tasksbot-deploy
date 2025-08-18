@@ -16,8 +16,6 @@ services:
       retries: 10
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"   # публикуем БД на хост
 
 volumes:
   pgdata:
