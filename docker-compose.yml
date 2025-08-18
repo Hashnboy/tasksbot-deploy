@@ -1,6 +1,9 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:15
+    container_name: tasksbot-postgres-1
     restart: always
     environment:
       POSTGRES_USER: postgres
@@ -8,7 +11,13 @@ services:
       POSTGRES_DB: postgres
     healthcheck:
       test: ["CMD-SHELL","pg_isready -U postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"   # <<< добавить ЭТО
+      - "5432:5432"   # публикуем БД на хост
+
+volumes:
+  pgdata:
