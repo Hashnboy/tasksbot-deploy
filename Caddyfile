@@ -1,8 +1,0 @@
-{
-  email you@example.com
-}
-
-bottg.online {
-  encode gzip
-  reverse_proxy app:5000
-}
