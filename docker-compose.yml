@@ -27,6 +27,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+command: python poller.py
     command: python tasks_bot.py
     # Для разработки можно подмонтировать код, чтобы не пересобирать образ:
     # volumes:
