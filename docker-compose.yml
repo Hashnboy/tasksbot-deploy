@@ -1,9 +1,6 @@
 version: "3.9"
 
-services:services:
-  app:
-    ...
-    command: python tasks_bot.py
+services:
   postgres:
     image: postgres:15
     container_name: tasksbot-postgres-1
@@ -19,6 +16,21 @@ services:services:
       retries: 10
     volumes:
       - pgdata:/var/lib/postgresql/data
+    # ВНЕШНИЙ порт НЕ публикуем, внутри сети контейнеров бд доступна по хосту "postgres:5432"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python tasks_bot.py
+    # Для разработки можно подмонтировать код, чтобы не пересобирать образ:
+    # volumes:
+    #   - ./:/app
 
 volumes:
   pgdata:
