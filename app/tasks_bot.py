@@ -48,6 +48,7 @@ if not API_TOKEN or not DB_URL:
 LOCAL_TZ = pytz.timezone(TZ_NAME)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("tasksbot")
+log.info("Boot TasksBot v2025-08-21-rules-ui")
 
 # --------- OpenAI (optional) ---------
 openai_client = None
