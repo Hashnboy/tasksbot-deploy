@@ -1,4 +1,3 @@
-cat > tasks_bot.py <<'PY'
 # -*- coding: utf-8 -*-
 """
 TasksBot (polling, PostgreSQL)
@@ -15,8 +14,10 @@ import pytz
 import schedule
 
 from telebot import TeleBot, types
-from sqlalchemy import (create_engine, Column, Integer, String, Text, Date, Time, DateTime,
-                        Boolean, func, and_, UniqueConstraint)
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Text, Date, Time, DateTime,
+    Boolean, func, and_, or_, UniqueConstraint
+)
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 
 # --------- ENV ---------
@@ -56,7 +57,7 @@ class User(Base):
 class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
-        # небольшая защита от дублей инстансов на одну дату у пользователя
+        # защита от дублей инстансов на одну дату у пользователя
         UniqueConstraint('user_id', 'date', 'text', 'category', 'subcategory', name='uq_task_per_day'),
     )
     id = Column(Integer, primary_key=True)
@@ -145,6 +146,10 @@ BASE_SUP_RULES = {
 }
 def norm_sup(name:str): return (name or "").strip().lower()
 
+def is_order_task_text(txt: str):
+    tl = (txt or "").lower()
+    return ("заказать" in tl) or ("заказ " in tl) or (tl.startswith("📦") and "заказ" in tl)
+
 def load_rule(sess, supplier_name:str):
     s = sess.query(Supplier).filter(func.lower(Supplier.name)==norm_sup(supplier_name)).first()
     if s and s.active:
@@ -163,26 +168,28 @@ def plan_next(sess, user_id:int, supplier:str, category:str, subcategory:str):
     if not rule: return []
     today = now_local().date()
     out = []
+
+    def ensure_task(d, text, tm):
+        q = (sess.query(Task)
+             .filter(Task.user_id==user_id, Task.date==d,
+                     Task.category==category, Task.subcategory==subcategory,
+                     Task.text==text, Task.is_repeating==False))
+        if not q.first():
+            sess.add(Task(user_id=user_id, date=d, category=category, subcategory=subcategory,
+                          text=text, deadline=tm, is_repeating=False, source=f"auto:{supplier}"))
+
     if rule["kind"]=="cycle_every_n_days":
         delivery = today + timedelta(days=rule["delivery_offset"])
         next_order = today + timedelta(days=rule["n_days"])
-        sess.merge(Task(user_id=user_id, date=delivery, category=category, subcategory=subcategory,
-                        text=f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})",
-                        deadline=parse_time("10:00")))
-        sess.merge(Task(user_id=user_id, date=next_order, category=category, subcategory=subcategory,
-                        text=f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})",
-                        deadline=parse_time(rule["deadline"])))
+        ensure_task(delivery, f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})", parse_time("10:00"))
+        ensure_task(next_order, f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})", parse_time(rule["deadline"]))
         sess.commit()
         out = [("delivery", delivery), ("order", next_order)]
     else:
         delivery = today + timedelta(days=rule["delivery_offset"])
         next_order = delivery + timedelta(days=max(1, (rule.get("shelf_days",3)-1)))
-        sess.merge(Task(user_id=user_id, date=delivery, category=category, subcategory=subcategory,
-                        text=f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})",
-                        deadline=parse_time("11:00")))
-        sess.merge(Task(user_id=user_id, date=next_order, category=category, subcategory=subcategory,
-                        text=f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})",
-                        deadline=parse_time(rule["deadline"])))
+        ensure_task(delivery, f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})", parse_time("11:00"))
+        ensure_task(next_order, f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})", parse_time(rule["deadline"]))
         sess.commit()
         out = [("delivery", delivery), ("order", next_order)]
     return out
@@ -198,20 +205,17 @@ def rule_hits_date(rule_text:str, created_at:datetime, target:date, template_dea
         base = created_at.date() if created_at else date(2025,1,1)
         delta = (target - base).days
         if delta >= 0 and delta % n == 0:
-            # время берём из шаблона
             return template_deadline
         return None
     # каждый вторник 12:00
     if rl.startswith("каждый"):
-        # день недели
         days = {"пн":0,"вт":1,"ср":2,"чт":3,"пт":4,"сб":5,"вс":6,
                 "понедельник":0,"вторник":1,"среда":2,"четверг":3,"пятница":4,"суббота":5,"воскресенье":6}
         wd = None
         for k,v in days.items():
             if f" {k}" in f" {rl}":
                 wd = v; break
-        if wd is None: return None
-        if target.weekday() != wd: return None
+        if wd is None or target.weekday() != wd: return None
         tm = re.search(r"(\d{1,2}:\d{2})", rl)
         return parse_time(tm.group(1)) if tm else template_deadline
     # по пн,ср[,...]
@@ -352,6 +356,10 @@ def start(m):
         sess.close()
     bot.send_message(m.chat.id, "Привет! Я твой ассистент по задачам.", reply_markup=main_menu())
 
+@bot.message_handler(commands=["help"])
+def help_cmd(m):
+    bot.send_message(m.chat.id, "Кнопки: 📅 Сегодня / 📆 Неделя / ➕ Добавить / ✅ Я сделал… / 🚚 Поставки / 🔎 Найти / 🧠 Ассистент", reply_markup=main_menu())
+
 @bot.message_handler(func=lambda msg: msg.text == "📅 Сегодня")
 def today(m):
     sess = SessionLocal()
@@ -385,8 +393,8 @@ def week(m):
         by = {}
         for t in rows: by.setdefault(dstr(t.date), []).append(t)
         parts = []
-        for ds in sorted(by.keys(), key=lambda s: parse_date(s)):
-            parts.append(format_grouped(by[ds], header_date=ds)); parts.append("")
+        for ds_ in sorted(by.keys(), key=lambda s: parse_date(s)):
+            parts.append(format_grouped(by[ds_], header_date=ds_)); parts.append("")
         bot.send_message(uid, "\n".join(parts), reply_markup=main_menu())
     finally:
         sess.close()
@@ -437,7 +445,7 @@ def done_text(m):
         for t in rows:
             if t.status=="выполнено": continue
             low = (t.text or "").lower()
-            is_order = ("заказ" in low or "закуп" in low)
+            is_order = is_order_task_text(low)
             if supplier:
                 if norm_sup(supplier) not in norm_sup(low): continue
                 if not is_order: continue
@@ -466,7 +474,7 @@ def orders_today(m):
     try:
         uid = m.chat.id
         rows = tasks_for_date(sess, uid, now_local().date())
-        orders = [t for t in rows if "заказ" in (t.text or "").lower()]
+        orders = [t for t in rows if is_order_task_text(t.text)]
         if not orders:
             bot.send_message(uid, "На сегодня заказов нет.", reply_markup=main_menu()); return
         items = [(short_line(t, i), t.id) for i,t in enumerate(orders, start=1)]
@@ -528,8 +536,8 @@ def do_search(m):
         by = {}
         for t in rows: by.setdefault(dstr(t.date), []).append(t)
         parts = []
-        for ds in sorted(by.keys(), key=lambda s: parse_date(s)):
-            parts.append(format_grouped(by[ds], header_date=ds)); parts.append("")
+        for ds_ in sorted(by.keys(), key=lambda s: parse_date(s)):
+            parts.append(format_grouped(by[ds_], header_date=ds_)); parts.append("")
         bot.send_message(uid, "\n".join(parts), reply_markup=main_menu())
     finally:
         sess.close()
@@ -566,6 +574,10 @@ def assistant_answer(m):
         bot.send_message(uid, "• Начни с задач с временем до 12:00.\n• Затем «Заказы» поставщиков — чтобы успеть до дедлайнов.\n• В конце — личные без срока.", reply_markup=main_menu())
     finally:
         sess.close()
+
+@bot.message_handler(func=lambda m: m.text == "⬅️ Назад")
+def back_to_main(m):
+    bot.send_message(m.chat.id, "Главное меню:", reply_markup=main_menu())
 
 # --------- Callbacks (карточки, пагинация, действия) ---------
 @bot.callback_query_handler(func=lambda c: True)
@@ -737,4 +749,3 @@ if __name__ == "__main__":
         except Exception as e:
             log.error("polling error: %s — retry in 3s", e)
             time.sleep(3)
-PY
