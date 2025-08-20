@@ -57,7 +57,6 @@ class User(Base):
 class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
-        # защита от дублей инстансов на одну дату у пользователя
         UniqueConstraint('user_id', 'date', 'text', 'category', 'subcategory', name='uq_task_per_day'),
     )
     id = Column(Integer, primary_key=True)
@@ -148,7 +147,7 @@ def norm_sup(name:str): return (name or "").strip().lower()
 
 def is_order_task_text(txt: str):
     tl = (txt or "").lower()
-    return ("заказать" in tl) or ("заказ " in tl) or (tl.startswith("📦") and "заказ" in tl)
+    return ("заказать" in tl) or ("заказ " in tl) or (tl.startswith("📦") and "заказ" in tl) or ("закуп" in tl)
 
 def load_rule(sess, supplier_name:str):
     s = sess.query(Supplier).filter(func.lower(Supplier.name)==norm_sup(supplier_name)).first()
@@ -198,7 +197,6 @@ def plan_next(sess, user_id:int, supplier:str, category:str, subcategory:str):
 def rule_hits_date(rule_text:str, created_at:datetime, target:date, template_deadline: dtime|None) -> dtime|None:
     if not rule_text: return None
     rl = rule_text.strip().lower()
-    # каждые N дней
     if rl.startswith("каждые"):
         m = re.findall(r"\d+", rl)
         n = int(m[0]) if m else 1
@@ -207,7 +205,6 @@ def rule_hits_date(rule_text:str, created_at:datetime, target:date, template_dea
         if delta >= 0 and delta % n == 0:
             return template_deadline
         return None
-    # каждый вторник 12:00
     if rl.startswith("каждый"):
         days = {"пн":0,"вт":1,"ср":2,"чт":3,"пт":4,"сб":5,"вс":6,
                 "понедельник":0,"вторник":1,"среда":2,"четверг":3,"пятница":4,"суббота":5,"воскресенье":6}
@@ -218,7 +215,6 @@ def rule_hits_date(rule_text:str, created_at:datetime, target:date, template_dea
         if wd is None or target.weekday() != wd: return None
         tm = re.search(r"(\d{1,2}:\d{2})", rl)
         return parse_time(tm.group(1)) if tm else template_deadline
-    # по пн,ср[,...]
     if rl.startswith("по "):
         m = re.findall(r"(пн|вт|ср|чт|пт|сб|вс)", rl)
         mapd = {"пн":0,"вт":1,"ср":2,"чт":3,"пт":4,"сб":5,"вс":6}
@@ -302,7 +298,6 @@ def main_menu():
 
 # --------- NLP add ---------
 def ai_parse_items(text, uid):
-    # try OpenAI JSON
     if openai_client:
         try:
             sys = ("Ты парсер задач. Верни только JSON-массив объектов: "
@@ -330,7 +325,6 @@ def ai_parse_items(text, uid):
             return out
         except Exception as e:
             log.warning("AI parse fail: %s", e)
-    # fallback
     tl = text.lower()
     cat = "Кофейня" if any(x in tl for x in ["кофейн","к-экспро","вылегжан"]) else ("Табачка" if "табач" in tl else "Личное")
     sub = "Центр" if "центр" in tl else ("Полет" if ("полет" in tl or "полёт" in tl) else ("Климово" if "климов" in tl else ""))
@@ -365,7 +359,6 @@ def today(m):
     sess = SessionLocal()
     try:
         uid = m.chat.id
-        # развернём повторяемые задачи на сегодня
         expand_repeats_for_date(sess, uid, now_local().date())
         rows = tasks_for_date(sess, uid, now_local().date())
         if not rows:
@@ -570,7 +563,6 @@ def assistant_answer(m):
                 return
             except Exception as e:
                 log.warning("assistant fail: %s", e)
-        # fallback
         bot.send_message(uid, "• Начни с задач с временем до 12:00.\n• Затем «Заказы» поставщиков — чтобы успеть до дедлайнов.\n• В конце — личные без срока.", reply_markup=main_menu())
     finally:
         sess.close()
@@ -579,7 +571,7 @@ def assistant_answer(m):
 def back_to_main(m):
     bot.send_message(m.chat.id, "Главное меню:", reply_markup=main_menu())
 
-# --------- Callbacks (карточки, пагинация, действия) ---------
+# --------- Callbacks ---------
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
     data = parse_cb(c.data) if c.data and c.data!="noop" else None
@@ -742,7 +734,6 @@ if __name__ == "__main__":
         pass
     threading.Thread(target=scheduler_loop, daemon=True).start()
     log.info("Starting polling…")
-    # бесконечный polling с авто‑рестартом
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=50, skip_pending=True)
