@@ -119,6 +119,19 @@ class Reminder(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 Base.metadata.create_all(bind=engine)
+def migrate_db():
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "ALTER TABLE users  ADD COLUMN IF NOT EXISTS tz VARCHAR(64) NOT NULL DEFAULT 'Europe/Moscow';"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE users  ADD COLUMN IF NOT EXISTS digest_08 BOOLEAN NOT NULL DEFAULT true;"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE tasks  ADD COLUMN IF NOT EXISTS assignee_id INTEGER;"
+        )
+
+migrate_db()
 
 # --------- BOT ---------
 bot = TeleBot(API_TOKEN, parse_mode="HTML")
