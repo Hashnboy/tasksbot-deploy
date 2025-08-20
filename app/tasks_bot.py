@@ -10,28 +10,37 @@ TasksBot (polling, PostgreSQL)
   • Делегирование задач другим пользователям, зависимости между задачами
   • Профиль: TZ, ежедневный дайджест 08:00 (локальная TZ)
   • GPT‑ассистент (OPENAI_API_KEY, опционально)
+
+Новые возможности:
+  • Directions/Rules: направления + правила (daily/weekdays/every_n_days) c notify_time и ранним уведомлением
+  • Расширение задач: priority, task_type, direction_id, supplier_id, auto_key (анти‑дубли)
+  • Безопасные callback’и (CALLBACK_SECRET), /health, сид направлений
 Env:
-  TELEGRAM_TOKEN, DATABASE_URL, TZ (default Europe/Moscow), OPENAI_API_KEY (optional)
+  TELEGRAM_TOKEN, DATABASE_URL, TZ (default Europe/Moscow), OPENAI_API_KEY (optional),
+  CALLBACK_SECRET (обязательно для подписи), ADMIN_IDS (опц., кому доступен /health)
 """
 
 import os, re, json, time, hmac, hashlib, logging, threading
 from datetime import datetime, timedelta, date, time as dtime
+from typing import Optional
 
 import pytz
 import schedule
 
-from telebot import TeleBot, types
+from telebot import TeleBot, types, apihelper
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, Date, Time, DateTime, Boolean,
-    ForeignKey, func, UniqueConstraint, and_, or_
+    ForeignKey, func, UniqueConstraint, Index, and_, or_
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
+from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session, relationship
 
 # --------- ENV / LOG ---------
 API_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 DB_URL      = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TZ_NAME     = os.getenv("TZ", "Europe/Moscow")
+CALLBACK_SECRET = os.getenv("CALLBACK_SECRET", "change-me").encode("utf-8")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()}
 
 if not API_TOKEN or not DB_URL:
     raise RuntimeError("Need TELEGRAM_TOKEN and DATABASE_URL envs")
@@ -62,10 +71,36 @@ class User(Base):
     digest_08 = Column(Boolean, default=True)
     created_at = Column(DateTime, server_default=func.now())
 
+class Direction(Base):
+    __tablename__ = "directions"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(120), unique=True, nullable=False)
+    emoji = Column(String(8), default="📂")
+    sort_order = Column(Integer, default=100)
+
+class Supplier(Base):
+    __tablename__ = "suppliers"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), unique=True, nullable=False)
+    rule = Column(String(255), default="")         # "каждые 2 дня" / "shelf 72h"
+    order_deadline = Column(String(10), default="14:00")
+    emoji = Column(String(8), default="📦")
+    delivery_offset_days = Column(Integer, default=1)
+    shelf_days = Column(Integer, default=0)
+    start_cycle = Column(Date, nullable=True)
+    auto = Column(Boolean, default=True)
+    active = Column(Boolean, default=True)
+    direction_id = Column(Integer, ForeignKey("directions.id", ondelete="SET NULL"), nullable=True)
+    direction = relationship("Direction", lazy="joined")
+    created_at = Column(DateTime, server_default=func.now())
+
 class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
         UniqueConstraint('user_id','date','text','category','subcategory','is_repeating', name='uq_task_day'),
+        Index("idx_tasks_user_date_status", "user_id", "date", "status"),
+        Index("idx_tasks_user_type", "user_id", "task_type"),
+        UniqueConstraint('user_id','date','auto_key', name='uq_tasks_auto_key_date_user'),
     )
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, index=True, nullable=False)
@@ -79,6 +114,14 @@ class Task(Base):
     repeat_rule = Column(String(255), default="")
     source = Column(String(255), default="")  # supplier, repeat-instance и т.п.
     is_repeating = Column(Boolean, default=False)
+    # NEW:
+    priority   = Column(String(20), default="medium")   # high|medium|low|future
+    task_type  = Column(String(20), default="todo")     # todo|purchase
+    direction_id = Column(Integer, ForeignKey("directions.id", ondelete="SET NULL"), nullable=True)
+    supplier_id  = Column(Integer, ForeignKey("suppliers.id", ondelete="SET NULL"), nullable=True)
+    auto_key  = Column(String(160), nullable=True)
+    direction = relationship("Direction", lazy="joined")
+    supplier  = relationship("Supplier", lazy="joined")
     created_at = Column(DateTime, server_default=func.now())
 
 class Subtask(Base):
@@ -94,31 +137,26 @@ class Dependency(Base):
     task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
     depends_on_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
 
-class Supplier(Base):
-    __tablename__ = "suppliers"
+class Rule(Base):
+    __tablename__ = "rules"
     id = Column(Integer, primary_key=True)
-    name = Column(String(255), unique=True, nullable=False)
-    rule = Column(String(255), default="")         # "каждые 2 дня" / "shelf 72h"
-    order_deadline = Column(String(10), default="14:00")
-    emoji = Column(String(8), default="📦")
-    delivery_offset_days = Column(Integer, default=1)
-    shelf_days = Column(Integer, default=0)
-    start_cycle = Column(Date, nullable=True)
-    auto = Column(Boolean, default=True)
+    user_id = Column(Integer, index=True, nullable=False)
+    direction_id = Column(Integer, ForeignKey("directions.id", ondelete="SET NULL"))
+    type = Column(String(20), nullable=False)  # 'todo'|'purchase'
+    supplier_id = Column(Integer, ForeignKey("suppliers.id", ondelete="SET NULL"))
+    periodicity = Column(String(20), nullable=False)  # 'daily'|'weekdays'|'every_n_days'
+    every_n = Column(Integer, nullable=True)
+    weekdays = Column(String(20), nullable=True)      # "пн,ср,пт"
+    notify_time = Column(Time, nullable=True)
+    notify_before_min = Column(Integer, default=0)
+    auto_create = Column(Boolean, default=True)
+    title = Column(Text, default="")
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, server_default=func.now())
-
-class Reminder(Base):
-    __tablename__ = "reminders"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, index=True)
-    task_id = Column(Integer, index=True)
-    date = Column(Date, nullable=False)
-    time = Column(Time, nullable=False)
-    fired = Column(Boolean, default=False)
-    created_at = Column(DateTime, server_default=func.now())
+    __table_args__ = (Index("idx_rules_user_active", "user_id", "active"),)
 
 Base.metadata.create_all(bind=engine)
+
 def migrate_db():
     with engine.begin() as conn:
         conn.exec_driver_sql(
@@ -130,12 +168,52 @@ def migrate_db():
         conn.exec_driver_sql(
             "ALTER TABLE tasks  ADD COLUMN IF NOT EXISTS assignee_id INTEGER;"
         )
-
+        # NEW columns/indexes (idempotent)
+        conn.exec_driver_sql(
+            "ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS direction_id INT NULL REFERENCES directions(id) ON DELETE SET NULL;"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'medium';"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_type VARCHAR(20) DEFAULT 'todo';"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS direction_id INT NULL REFERENCES directions(id) ON DELETE SET NULL;"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS supplier_id INT NULL REFERENCES suppliers(id) ON DELETE SET NULL;"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS auto_key VARCHAR(160) NULL;"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_user_date_status ON tasks(user_id, date, status);"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_user_type ON tasks(user_id, task_type);"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_rules_user_active ON rules(user_id, active);"
+        )
+        # уникальность авто‑ключа
+        conn.exec_driver_sql("""
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'uq_tasks_auto_key_date_user'
+  ) THEN
+    ALTER TABLE tasks
+    ADD CONSTRAINT uq_tasks_auto_key_date_user UNIQUE (user_id, date, auto_key);
+  END IF;
+END $$;
+""")
 migrate_db()
 
 # --------- BOT ---------
 bot = TeleBot(API_TOKEN, parse_mode="HTML")
 PAGE = 8
+LAST_TICK: Optional[datetime] = None
 
 # --------- Utils ---------
 def now_local():
@@ -150,16 +228,19 @@ def weekday_ru(d: date):
     names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
     return names[d.weekday()]
 
+def _cb_sign(s:str)->str:
+    return hashlib.sha1(CALLBACK_SECRET + s.encode("utf-8")).hexdigest()[:6]
+
 def mk_cb(action, **kwargs):
-    payload = {"a": action, **kwargs}
-    s = json.dumps(payload, ensure_ascii=False)
-    sig = hmac.new(b"cb-key", s.encode("utf-8"), hashlib.sha1).hexdigest()[:6]
+    payload = {"v":1, "a": action, **kwargs}
+    s = json.dumps(payload, ensure_ascii=False, separators=(",",":"))
+    sig = _cb_sign(s)
     return f"{sig}|{s}"
 
 def parse_cb(data):
     try:
         sig, s = data.split("|", 1)
-        if hmac.new(b"cb-key", s.encode("utf-8"), hashlib.sha1).hexdigest()[:6] != sig:
+        if _cb_sign(s) != sig:
             return None
         return json.loads(s)
     except Exception:
@@ -172,7 +253,22 @@ def ensure_user(sess, uid, name="", tz=None):
         sess.add(u); sess.commit()
     return u
 
-# --------- Suppliers rules / plan ---------
+# безопасная отправка (бэкофф)
+def send_safe(text, chat_id, **kwargs):
+    delay = 0.5
+    for _ in range(6):
+        try:
+            return bot.send_message(chat_id, text, **kwargs)
+        except apihelper.ApiTelegramException as e:
+            sc = getattr(e.result, "status_code", None)
+            if sc in (429, 500, 502, 503, 504):
+                time.sleep(delay); delay *= 2; continue
+            time.sleep(delay); delay *= 2
+        except Exception:
+            time.sleep(delay); delay *= 2
+    return bot.send_message(chat_id, text[:4000], **kwargs)
+
+# --------- Suppliers rules / plan (твоя логика оставлена) ---------
 BASE_SUP_RULES = {
     "к-экспро": {"kind":"cycle_every_n_days","n_days":2,"delivery_offset":1,"deadline":"14:00","emoji":"📦"},
     "ип вылегжанина": {"kind":"delivery_shelf_then_order","delivery_offset":1,"shelf_days":3,"deadline":"14:00","emoji":"🥘"},
@@ -202,10 +298,10 @@ def plan_next(sess, user_id:int, supplier:str, category:str, subcategory:str):
         next_order = today + timedelta(days=rule["n_days"])
         sess.merge(Task(user_id=user_id, date=delivery, category=category, subcategory=subcategory,
                         text=f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})",
-                        deadline=parse_time("10:00")))
+                        deadline=parse_time("10:00"), task_type="purchase", priority="high"))
         sess.merge(Task(user_id=user_id, date=next_order, category=category, subcategory=subcategory,
                         text=f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})",
-                        deadline=parse_time(rule["deadline"])))
+                        deadline=parse_time(rule["deadline"]), task_type="purchase", priority="high"))
         sess.commit()
         out = [("delivery", delivery), ("order", next_order)]
     else:
@@ -213,15 +309,15 @@ def plan_next(sess, user_id:int, supplier:str, category:str, subcategory:str):
         next_order = delivery + timedelta(days=max(1, (rule.get("shelf_days",3)-1)))
         sess.merge(Task(user_id=user_id, date=delivery, category=category, subcategory=subcategory,
                         text=f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})",
-                        deadline=parse_time("11:00")))
+                        deadline=parse_time("11:00"), task_type="purchase", priority="high"))
         sess.merge(Task(user_id=user_id, date=next_order, category=category, subcategory=subcategory,
                         text=f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})",
-                        deadline=parse_time(rule["deadline"])))
+                        deadline=parse_time(rule["deadline"]), task_type="purchase", priority="high"))
         sess.commit()
         out = [("delivery", delivery), ("order", next_order)]
     return out
 
-# --------- Repeats ---------
+# --------- Repeats (твоя логика оставлена) ---------
 def rule_hits_date(rule_text:str, created_at:datetime, target:date, template_deadline: dtime|None) -> dtime|None:
     if not rule_text: return None
     rl = rule_text.strip().lower()
@@ -265,7 +361,8 @@ def expand_repeats_for_date(sess, uid:int, target:date):
 def short_line(t: Task, idx=None):
     assignee = f" → @{t.assignee_id}" if t.assignee_id and t.assignee_id!=t.user_id else ""
     p = f"{idx}. " if idx is not None else ""
-    return f"{p}{t.category}/{t.subcategory or '—'}: {t.text[:40]}… (до {tstr(t.deadline)}){assignee}"
+    pr_emoji = {"high":"🔴","medium":"🟡","low":"🟢","future":"⏳"}.get(t.priority or "medium","🟡")
+    return f"{p}{pr_emoji} {t.category}/{t.subcategory or '—'}: {t.text[:40]}… (до {tstr(t.deadline)}){assignee}"
 
 def format_grouped(tasks, header_date=None):
     if not tasks: return "Задач нет."
@@ -279,7 +376,8 @@ def format_grouped(tasks, header_date=None):
             out.append(f"📂 <b>{t.category or '—'}</b>"); cur_cat = t.category; cur_sub = None
         if t.subcategory != cur_sub:
             out.append(f"  └ <b>{t.subcategory or '—'}</b>"); cur_sub = t.subcategory
-        line = f"    └ {icon} {t.text}"
+        pr_emoji = {"high":"🔴","medium":"🟡","low":"🟢","future":"⏳"}.get(t.priority or "medium","🟡")
+        line = f"    └ {icon} {pr_emoji} {t.text}"
         if t.deadline: line += f"  <i>(до {tstr(t.deadline)})</i>"
         if t.assignee_id and t.assignee_id!=t.user_id: line += f"  [делегировано: {t.assignee_id}]"
         out.append(line)
@@ -314,10 +412,10 @@ def main_menu():
     kb.row("📅 Сегодня","📆 Неделя")
     kb.row("➕ Добавить","✅ Я сделал…","🧠 Ассистент")
     kb.row("🚚 Поставки","🔎 Найти")
-    kb.row("👤 Профиль","🧩 Зависимости","🤝 Делегирование")
+    kb.row("⚙️ Правила","👤 Профиль","🧩 Зависимости","🤝 Делегирование")
     return kb
 
-# --------- NLP add ---------
+# --------- NLP add (твоя логика) ---------
 def ai_parse_items(text, uid):
     if openai_client:
         try:
@@ -367,6 +465,11 @@ def start(m):
     sess = SessionLocal()
     try:
         ensure_user(sess, m.chat.id, m.from_user.full_name if m.from_user else "", tz=TZ_NAME)
+        # сид направлений (если пусто)
+        if sess.query(Direction).count() == 0:
+            for name,emoji,sort in [("Кофейня","☕",10),("WB","📦",20),("Табачка","🚬",30),("Личное","🏠",40)]:
+                sess.add(Direction(name=name, emoji=emoji, sort_order=sort))
+            sess.commit()
     finally:
         sess.close()
     bot.send_message(m.chat.id, "Привет! Я твой ассистент по задачам.", reply_markup=main_menu())
@@ -424,9 +527,11 @@ def add_text(m):
             dt = parse_date(it["date"]) if it["date"] else now_local().date()
             tm = parse_time(it["time"]) if it["time"] else None
             is_rep = bool((it.get("repeat") or "").strip())
+            # NEW: дефолты для новых полей
             t = Task(user_id=uid, date=dt, category=it["category"], subcategory=it["subcategory"],
                      text=it["task"], deadline=tm, repeat_rule=it["repeat"], source=it["supplier"],
-                     is_repeating=is_rep)
+                     is_repeating=is_rep, task_type=("purchase" if it.get("supplier") else "todo"),
+                     priority=("high" if it.get("supplier") else "medium"))
             sess.add(t)
             if is_rep: templates += 1
             else: created += 1
@@ -703,9 +808,11 @@ def cb(c):
             if deps:
                 dep_ids = [str(d.depends_on_id) for d in deps]
                 dep_text = f"\n🔗 Зависит от: {', '.join(dep_ids)}"
+            pr_emoji = {"high":"🔴","medium":"🟡","low":"🟢","future":"⏳"}.get(t.priority or "medium","🟡")
             text = (f"<b>{t.text}</b>\n"
                     f"📅 {weekday_ru(t.date)} — {dstr(t.date)}\n"
                     f"📁 {t.category}/{t.subcategory or '—'}\n"
+                    f"⚑ Тип: {t.task_type or 'todo'}  • Приоритет: {pr_emoji}\n"
                     f"⏰ Дедлайн: {dl}\n"
                     f"📝 Статус: {t.status or '—'}{dep_text}")
             kb = types.InlineKeyboardMarkup()
@@ -713,11 +820,23 @@ def cb(c):
                    types.InlineKeyboardButton("🗑 Удалить", callback_data=mk_cb("del", id=tid)))
             kb.row(types.InlineKeyboardButton("✏️ Дедлайн", callback_data=mk_cb("setdl", id=tid)),
                    types.InlineKeyboardButton("⏰ Напоминание", callback_data=mk_cb("rem", id=tid)))
-            kb.row(types.InlineKeyboardButton("➕ Подзадача", callback_data=mk_cb("sub", id=tid)),
-                   types.InlineKeyboardButton("🤝 Делегировать", callback_data=mk_cb("dlg", id=tid)))
+            # быстрый перенос (минимум)
+            kb.row(types.InlineKeyboardButton("📤 Сегодня", callback_data=mk_cb("mv", id=tid, to="today")),
+                   types.InlineKeyboardButton("📤 Завтра",  callback_data=mk_cb("mv", id=tid, to="tomorrow")),
+                   types.InlineKeyboardButton("📤 +1д",     callback_data=mk_cb("mv", id=tid, to="+1")))
             bot.answer_callback_query(c.id)
             bot.send_message(uid, text, reply_markup=kb)
             return
+        if a=="mv":
+            tid = int(data.get("id")); to = data.get("to")
+            t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
+            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            base = now_local().date()
+            if to=="today": t.date = base
+            elif to=="tomorrow": t.date = base + timedelta(days=1)
+            elif to=="+1": t.date = t.date + timedelta(days=1)
+            sess.commit()
+            bot.answer_callback_query(c.id, "Перенесено"); return
         if a=="page":
             rows = tasks_for_date(sess, uid, now_local().date())
             items = [(short_line(t, i), t.id) for i,t in enumerate(rows, start=1)]
@@ -845,6 +964,532 @@ def delegate_to_user(m, tid):
         except Exception: pass
     finally:
         sess.close()
+# ===== Rules UI (список/добавить/управление) =====
+RULE_WIZ = {}      # uid -> {"step":..., "data":{...}}
+RULE_EDIT = {}     # uid -> {"field":..., "rule_id":...}
+
+def rule_brief(r: Rule) -> str:
+    per = {"daily":"ежедневно","weekdays":f"по {r.weekdays or '—'}","every_n_days":f"каждые {r.every_n or '?'} дн."}.get(r.periodicity, r.periodicity)
+    auto = "on" if r.auto_create else "off"
+    act  = "✅" if r.active else "⛔"
+    tpe  = "📌" if r.type=="todo" else "📦"
+    dirn = "-"
+    if r.direction and r.direction.name:
+        dirn = f"{r.direction.emoji or '📂'} {r.direction.name}"
+    sup  = "-"
+    if r.supplier:
+        sup = r.supplier.name
+    nt   = tstr(r.notify_time) if r.notify_time else "—"
+    nb   = r.notify_before_min or 0
+    ttl  = (r.title or "").strip() or "(без названия)"
+    return (f"{act} {tpe} <b>{ttl}</b>\n"
+            f"• Напр.: {dirn}\n"
+            f"• Поставщик: {sup}\n"
+            f"• Периодичность: {per}\n"
+            f"• Время: {nt}  • Ранний пинг: {nb} мин\n"
+            f"• Автосоздание: {auto}")
+
+def rules_list_kb(rules, page=1, per_page=6):
+    total_pages = max(1, (len(rules)+per_page-1)//per_page)
+    page = max(1, min(page, total_pages))
+    start, end = (page-1)*per_page, min(len(rules), page*per_page)
+    kb = types.InlineKeyboardMarkup()
+    for r in rules[start:end]:
+        row1 = [
+            types.InlineKeyboardButton("✏️", callback_data=mk_cb("r_edit", id=r.id)),
+            types.InlineKeyboardButton("🔔", callback_data=mk_cb("r_time", id=r.id)),
+            types.InlineKeyboardButton("🔄", callback_data=mk_cb("r_auto", id=r.id)),
+            types.InlineKeyboardButton("⏯", callback_data=mk_cb("r_active", id=r.id)),
+            types.InlineKeyboardButton("🗑", callback_data=mk_cb("r_del", id=r.id)),
+        ]
+        kb.row(*row1)
+        kb.row(types.InlineKeyboardButton(f"ℹ️ #{r.id}", callback_data=mk_cb("r_info", id=r.id)))
+    nav = []
+    if page>1:
+        nav.append(types.InlineKeyboardButton("⬅️", callback_data=mk_cb("r_page", p=page-1)))
+    nav.append(types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page<total_pages:
+        nav.append(types.InlineKeyboardButton("➡️", callback_data=mk_cb("r_page", p=page+1)))
+    if nav: kb.row(*nav)
+    kb.row(types.InlineKeyboardButton("➕ Добавить правило", callback_data=mk_cb("r_add")))
+    return kb, page, total_pages
+
+@bot.message_handler(func=lambda msg: msg.text == "⚙️ Правила")
+def rules_menu(m):
+    sess = SessionLocal()
+    try:
+        uid = m.chat.id
+        rules = (sess.query(Rule)
+                 .filter(Rule.user_id==uid)
+                 .order_by(Rule.active.desc(), Rule.id.desc())
+                 .all())
+        if not rules:
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("➕ Добавить правило", callback_data=mk_cb("r_add")))
+            bot.send_message(uid, "Правил пока нет.", reply_markup=main_menu())
+            bot.send_message(uid, "Создать новое правило:", reply_markup=kb)
+            return
+        text = "⚙️ Твои правила:"
+        kb, page, total = rules_list_kb(rules, 1)
+        bot.send_message(uid, text, reply_markup=main_menu())
+        # отправим краткие карточки пачкой
+        for r in rules[:6]:
+            bot.send_message(uid, rule_brief(r), reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("Открыть действия", callback_data=mk_cb("r_info", id=r.id))
+            ))
+        bot.send_message(uid, "Навигация по правилам:", reply_markup=kb)
+    finally:
+        sess.close()
+
+# ---- Wizard "add rule" ----
+def r_wiz_reset(uid): RULE_WIZ.pop(uid, None)
+def r_wiz(uid): return RULE_WIZ.setdefault(uid, {"step":"dir","data":{}})
+
+def ask_direction(chat_id):
+    sess = SessionLocal()
+    try:
+        dirs = sess.query(Direction).order_by(Direction.sort_order.asc()).all()
+    finally:
+        sess.close()
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for d in dirs:
+        kb.add(types.InlineKeyboardButton(f"{d.emoji or '📂'} {d.name}", callback_data=mk_cb("r_dir", id=d.id)))
+    kb.add(types.InlineKeyboardButton("— Без направления —", callback_data=mk_cb("r_dir", id=0)))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=mk_cb("r_cancel")))
+    send_safe("Шаг 1/8: Выбери направление", chat_id, reply_markup=kb)
+
+def ask_type(chat_id):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("📌 Обычное дело", callback_data=mk_cb("r_type", v="todo")),
+        types.InlineKeyboardButton("📦 Закупка", callback_data=mk_cb("r_type", v="purchase")),
+    )
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("r_back")))
+    send_safe("Шаг 2/8: Выбери тип", chat_id, reply_markup=kb)
+
+def ask_supplier(chat_id, direction_id):
+    sess = SessionLocal()
+    try:
+        q = sess.query(Supplier)
+        if direction_id:
+            q = q.filter(Supplier.direction_id==direction_id)
+        sups = q.order_by(Supplier.name.asc()).limit(50).all()
+    finally:
+        sess.close()
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for s in sups:
+        kb.add(types.InlineKeyboardButton(s.name, callback_data=mk_cb("r_sup", id=s.id)))
+    kb.add(types.InlineKeyboardButton("— Без поставщика —", callback_data=mk_cb("r_sup", id=0)))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("r_back")))
+    send_safe("Шаг 3/8: Выбери поставщика", chat_id, reply_markup=kb)
+
+def ask_periodicity(chat_id):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("Ежедневно", callback_data=mk_cb("r_per", v="daily")),
+        types.InlineKeyboardButton("По дням недели", callback_data=mk_cb("r_per", v="weekdays")),
+        types.InlineKeyboardButton("Каждые N дней", callback_data=mk_cb("r_per", v="every_n_days")),
+    )
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("r_back")))
+    send_safe("Шаг 4/8: Выбери периодичность", chat_id, reply_markup=kb)
+
+def ask_weekdays(chat_id, preselected:str=""):
+    days = [("пн","Пн"),("вт","Вт"),("ср","Ср"),("чт","Чт"),("пт","Пт"),("сб","Сб"),("вс","Вс")]
+    sel = {x.strip() for x in (preselected or "").split(",") if x.strip()}
+    kb = types.InlineKeyboardMarkup(row_width=4)
+    for code, label in days:
+        mark = "✅" if code in sel else "⬜"
+        kb.add(types.InlineKeyboardButton(f"{mark} {label}", callback_data=mk_cb("r_wd", d=code)))
+    kb.add(types.InlineKeyboardButton("Готово", callback_data=mk_cb("r_wd_done")))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("r_back")))
+    send_safe("Отметь дни недели (переключатели):", chat_id, reply_markup=kb)
+
+def ask_every_n(chat_id):
+    send_safe("Введи N (через сколько дней повторять), например: 2", chat_id)
+
+def ask_notify_time(chat_id):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("Без времени", callback_data=mk_cb("r_time_set", v="none")),
+        types.InlineKeyboardButton("Указать время", callback_data=mk_cb("r_time_set", v="ask")),
+    )
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("r_back")))
+    send_safe("Шаг 5/8: Время уведомления", chat_id, reply_markup=kb)
+
+def ask_before(chat_id):
+    kb = types.InlineKeyboardMarkup(row_width=5)
+    for m in [0,5,10,30,60]:
+        kb.add(types.InlineKeyboardButton(f"{m} мин", callback_data=mk_cb("r_before", v=m)))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("r_back")))
+    send_safe("Шаг 6/8: Ранний пинг (за сколько минут)", chat_id, reply_markup=kb)
+
+def ask_auto(chat_id):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("Автосоздание: ON", callback_data=mk_cb("r_auto_set", v=1)),
+        types.InlineKeyboardButton("Автосоздание: OFF", callback_data=mk_cb("r_auto_set", v=0)),
+    )
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("r_back")))
+    send_safe("Шаг 7/8: Автосоздание задач", chat_id, reply_markup=kb)
+
+def ask_title(chat_id):
+    send_safe("Шаг 8/8: Введи заголовок (текст) правила", chat_id)
+
+def r_wiz_summary(data:dict)->str:
+    per = data.get("periodicity")
+    if per=="weekdays":
+        per_h = f"по {data.get('weekdays') or '—'}"
+    elif per=="every_n_days":
+        per_h = f"каждые {data.get('every_n') or '?'} дн."
+    else:
+        per_h = "ежедневно"
+    tpe  = "📌" if data.get("type")=="todo" else "📦"
+    nt   = tstr(data.get("notify_time")) if isinstance(data.get("notify_time"), dtime) else "—"
+    nb   = data.get("notify_before_min", 0)
+    auto = "on" if data.get("auto_create") else "off"
+    ttl  = (data.get("title") or "").strip() or "(без названия)"
+    return (f"{tpe} <b>{ttl}</b>\n"
+            f"• Периодичность: {per_h}\n"
+            f"• Время: {nt}  • Ранний пинг: {nb} мин\n"
+            f"• Автосоздание: {auto}")
+
+def r_wiz_save(uid, chat_id):
+    sess = SessionLocal()
+    try:
+        data = RULE_WIZ.get(uid, {}).get("data", {})
+        r = Rule(
+            user_id=uid,
+            direction_id=(data.get("direction_id") or None),
+            type=data.get("type","todo"),
+            supplier_id=(data.get("supplier_id") or None),
+            periodicity=data.get("periodicity","daily"),
+            every_n=(data.get("every_n") or None),
+            weekdays=(data.get("weekdays") or None),
+            notify_time=(data.get("notify_time") if isinstance(data.get("notify_time"), dtime) else None),
+            notify_before_min=int(data.get("notify_before_min") or 0),
+            auto_create=bool(data.get("auto_create", True)),
+            title=data.get("title") or "",
+            active=True
+        )
+        sess.add(r); sess.commit()
+        send_safe("✅ Правило сохранено:\n\n"+rule_brief(r), chat_id)
+    finally:
+        sess.close()
+    r_wiz_reset(uid)
+
+@bot.callback_query_handler(func=lambda c: c.data and parse_cb(c.data) and parse_cb(c.data).get("a","").startswith("r_") or c.data in ("noop",))
+def rules_callbacks(c):
+    uid = c.from_user.id
+    chat_id = c.message.chat.id
+    data = parse_cb(c.data) if c.data!="noop" else None
+    if not data:
+        bot.answer_callback_query(c.id); return
+    a = data.get("a")
+
+    # отмена/назад
+    if a == "r_cancel":
+        r_wiz_reset(uid)
+        bot.answer_callback_query(c.id, "Отменено")
+        send_safe("Ок, отменил создание правила.", chat_id); return
+    if a == "r_back":
+        step = r_wiz(uid).get("step")
+        # примитивный шаг назад по дереву
+        if step in ("type","dir"): ask_direction(chat_id); r_wiz(uid)["step"]="dir"
+        elif step in ("supplier","priority"): ask_type(chat_id); r_wiz(uid)["step"]="type"
+        elif step in ("per","weekdays","everyn"): ask_periodicity(chat_id); r_wiz(uid)["step"]="per"
+        elif step in ("time","before"): ask_notify_time(chat_id); r_wiz(uid)["step"]="time"
+        elif step in ("auto","title"): ask_before(chat_id); r_wiz(uid)["step"]="before"
+        else:
+            send_safe("Вернулся в начало.", chat_id); r_wiz_reset(uid)
+        bot.answer_callback_query(c.id); return
+
+    # старт создания
+    if a == "r_add":
+        RULE_WIZ[uid] = {"step":"dir","data":{}}
+        ask_direction(chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # выбор направления
+    if a == "r_dir":
+        r_wiz(uid)["data"]["direction_id"] = int(data.get("id") or 0) or None
+        r_wiz(uid)["step"] = "type"
+        ask_type(chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # выбор типа
+    if a == "r_type":
+        r_wiz(uid)["data"]["type"] = data.get("v")
+        if data.get("v") == "purchase":
+            r_wiz(uid)["step"] = "supplier"
+            ask_supplier(chat_id, r_wiz(uid)["data"].get("direction_id"))
+        else:
+            r_wiz(uid)["step"] = "per"
+            ask_periodicity(chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # выбор поставщика
+    if a == "r_sup":
+        r_wiz(uid)["data"]["supplier_id"] = int(data.get("id") or 0) or None
+        r_wiz(uid)["step"] = "per"
+        ask_periodicity(chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # периодичность
+    if a == "r_per":
+        v = data.get("v")
+        r_wiz(uid)["data"]["periodicity"] = v
+        if v == "weekdays":
+            r_wiz(uid)["data"]["weekdays"] = ""
+            r_wiz(uid)["step"] = "weekdays"
+            ask_weekdays(chat_id, "")
+        elif v == "every_n_days":
+            r_wiz(uid)["step"] = "everyn"
+            ask_every_n(chat_id)
+        else:
+            r_wiz(uid)["step"] = "time"
+            ask_notify_time(chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # выбор дней недели (переключатели)
+    if a == "r_wd":
+        cur = r_wiz(uid)["data"].get("weekdays","")
+        parts = [x.strip() for x in cur.split(",") if x.strip()]
+        d = data.get("d")
+        if d in parts:
+            parts.remove(d)
+        else:
+            parts.append(d)
+        r_wiz(uid)["data"]["weekdays"] = ",".join([p for p in parts if p])
+        ask_weekdays(chat_id, r_wiz(uid)["data"]["weekdays"])
+        bot.answer_callback_query(c.id); return
+
+    if a == "r_wd_done":
+        if not r_wiz(uid)["data"].get("weekdays"):
+            bot.answer_callback_query(c.id, "Выбери хотя бы один день", show_alert=True); return
+        r_wiz(uid)["step"] = "time"
+        ask_notify_time(chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # время уведомления
+    if a == "r_time_set":
+        if data.get("v") == "none":
+            r_wiz(uid)["data"]["notify_time"] = None
+            r_wiz(uid)["step"] = "before"
+            ask_before(chat_id)
+        else:
+            r_wiz(uid)["step"] = "time_ask"
+            send_safe("Введи время в формате ЧЧ:ММ", chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # ранний пинг (минуты)
+    if a == "r_before":
+        r_wiz(uid)["data"]["notify_before_min"] = int(data.get("v") or 0)
+        r_wiz(uid)["step"] = "auto"
+        ask_auto(chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # авто‑создание
+    if a == "r_auto_set":
+        r_wiz(uid)["data"]["auto_create"] = bool(int(data.get("v")))
+        r_wiz(uid)["step"] = "title"
+        ask_title(chat_id)
+        bot.answer_callback_query(c.id); return
+
+    # карточка/действия по правилу
+    if a == "r_info":
+        rid = int(data.get("id"))
+        sess = SessionLocal()
+        try:
+            r = sess.query(Rule).filter(Rule.id==rid, Rule.user_id==uid).first()
+            if not r:
+                bot.answer_callback_query(c.id, "Правило не найдено", show_alert=True); return
+            kb = types.InlineKeyboardMarkup()
+            kb.row(
+                types.InlineKeyboardButton("✏️ Заголовок", callback_data=mk_cb("r_edit", id=rid)),
+                types.InlineKeyboardButton("🔔 Время", callback_data=mk_cb("r_time", id=rid)),
+            )
+            kb.row(
+                types.InlineKeyboardButton("🔄 Автосоздание", callback_data=mk_cb("r_auto", id=rid)),
+                types.InlineKeyboardButton("⏯ Активно/Выкл", callback_data=mk_cb("r_active", id=rid)),
+            )
+            kb.row(types.InlineKeyboardButton("🗑 Удалить", callback_data=mk_cb("r_del", id=rid)))
+            send_safe(rule_brief(r), chat_id, reply_markup=kb)
+        finally:
+            sess.close()
+        bot.answer_callback_query(c.id); return
+
+    if a == "r_auto":
+        rid = int(data.get("id"))
+        sess = SessionLocal()
+        try:
+            r = sess.query(Rule).filter(Rule.id==rid, Rule.user_id==uid).first()
+            if not r: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            r.auto_create = not r.auto_create; sess.commit()
+            bot.answer_callback_query(c.id, f"Автосоздание: {'on' if r.auto_create else 'off'}")
+        finally:
+            sess.close()
+        return
+
+    if a == "r_active":
+        rid = int(data.get("id"))
+        sess = SessionLocal()
+        try:
+            r = sess.query(Rule).filter(Rule.id==rid, Rule.user_id==uid).first()
+            if not r: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            r.active = not r.active; sess.commit()
+            bot.answer_callback_query(c.id, f"{'Включено' if r.active else 'Выключено'}")
+        finally:
+            sess.close()
+        return
+
+    if a == "r_del":
+        rid = int(data.get("id"))
+        sess = SessionLocal()
+        try:
+            r = sess.query(Rule).filter(Rule.id==rid, Rule.user_id==uid).first()
+            if not r: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            sess.delete(r); sess.commit()
+            bot.answer_callback_query(c.id, "Удалено", show_alert=True)
+        finally:
+            sess.close()
+        return
+
+    if a == "r_edit":
+        rid = int(data.get("id"))
+        RULE_EDIT[uid] = {"field":"title", "rule_id":rid}
+        bot.answer_callback_query(c.id)
+        send_safe("Введи новый заголовок правила:", chat_id)
+        return
+
+    if a == "r_time":
+        rid = int(data.get("id"))
+        RULE_EDIT[uid] = {"field":"time", "rule_id":rid}
+        bot.answer_callback_query(c.id)
+        send_safe("Введи время ЧЧ:ММ или «none»", chat_id)
+        return
+
+# ---- обработка текстовых шагов мастера/редактирования ----
+@bot.message_handler(func=lambda m: RULE_WIZ.get(m.chat.id, {}).get("step") in ("everyn","time_ask","title") or RULE_EDIT.get(m.chat.id))
+def rules_text_steps(m):
+    uid = m.chat.id
+    sess = None
+    # приоритет редактирования существующего правила
+    if RULE_EDIT.get(uid):
+        rid = RULE_EDIT[uid]["rule_id"]; field = RULE_EDIT[uid]["field"]
+        sess = SessionLocal()
+        try:
+            r = sess.query(Rule).filter(Rule.id==rid, Rule.user_id==uid).first()
+            if not r:
+                RULE_EDIT.pop(uid, None)
+                send_safe("Правило не найдено.", uid); return
+            txt = (m.text or "").strip()
+            if field == "title":
+                r.title = txt
+                sess.commit()
+                send_safe("✅ Обновил заголовок.\n\n"+rule_brief(r), uid)
+            elif field == "time":
+                if txt.lower() == "none":
+                    r.notify_time = None
+                else:
+                    try:
+                        r.notify_time = parse_time(txt)
+                    except Exception:
+                        send_safe("Формат времени: ЧЧ:ММ или «none»", uid); return
+                sess.commit()
+                send_safe("✅ Обновил время.\n\n"+rule_brief(r), uid)
+        finally:
+            sess.close()
+        RULE_EDIT.pop(uid, None)
+        return
+
+    # шаги мастера создания
+    step = RULE_WIZ[uid]["step"]
+    if step == "everyn":
+        try:
+            n = int((m.text or "").strip())
+            if n <= 0: raise ValueError()
+        except Exception:
+            send_safe("Нужно целое число > 0. Введи N ещё раз:", uid); return
+        RULE_WIZ[uid]["data"]["every_n"] = n
+        RULE_WIZ[uid]["step"] = "time"
+        ask_notify_time(uid)
+        return
+
+    if step == "time_ask":
+        txt = (m.text or "").strip()
+        try:
+            RULE_WIZ[uid]["data"]["notify_time"] = parse_time(txt)
+        except Exception:
+            send_safe("Формат времени: ЧЧ:ММ. Попробуй ещё раз:", uid); return
+        RULE_WIZ[uid]["step"] = "before"
+        ask_before(uid)
+        return
+
+    if step == "title":
+        RULE_WIZ[uid]["data"]["title"] = (m.text or "").strip()
+        send_safe("Проверь сводку и сохраняю:\n\n"+r_wiz_summary(RULE_WIZ[uid]["data"]), uid)
+        r_wiz_save(uid, uid)
+        return
+
+# --------- Правила (джоб и утилиты) ---------
+def make_auto_key(user_id:int, dt:date, title:str, direction_id:Optional[int], supplier_id:Optional[int], task_type:str)->str:
+    raw = f"{user_id}|{dt.isoformat()}|{title}|{direction_id or 0}|{supplier_id or 0}|{task_type}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+def rule_hits_today(r: Rule, target: date) -> bool:
+    if r.periodicity == "daily":
+        return True
+    if r.periodicity == "every_n_days":
+        base = (r.created_at.date() if r.created_at else date(2025,1,1))
+        delta = (target - base).days
+        return (delta >= 0 and r.every_n and r.every_n > 0 and delta % r.every_n == 0)
+    if r.periodicity == "weekdays":
+        days = {"пн":0,"вт":1,"ср":2,"чт":3,"пт":4,"сб":5,"вс":6}
+        wd_list = [x.strip() for x in (r.weekdays or "").split(",") if x.strip()]
+        wanted = {days.get(x) for x in wd_list if x in days}
+        return target.weekday() in wanted
+    return False
+
+def rule_human(r: Rule) -> str:
+    base = "📌" if r.type=="todo" else "📦"
+    return f"{base} {r.title or '(без названия)'}"
+
+def job_rules_tick():
+    sess = SessionLocal()
+    try:
+        now = now_local()
+        today = now.date()
+        rules = sess.query(Rule).filter(Rule.active==True).all()
+        for r in rules:
+            # раннее уведомление
+            if r.notify_time:
+                nt = datetime.combine(today, r.notify_time)
+                if nt.tzinfo is None:
+                    nt = LOCAL_TZ.localize(nt)
+                before = nt - timedelta(minutes=(r.notify_before_min or 0))
+                if before <= now < nt:
+                    try:
+                        send_safe(f"⏰ Скоро по правилу: {rule_human(r)}", r.user_id)
+                    except Exception as e:
+                        log.warning("rule notify_before send error: %s", e)
+
+            # автосоздание задач
+            if rule_hits_today(r, today) and r.auto_create:
+                title = r.title or ("Задача по правилу" if r.type=="todo" else "Заказ по правилу")
+                ak = make_auto_key(r.user_id, today, title, r.direction_id, r.supplier_id, r.type)
+                dup = sess.query(Task).filter(Task.user_id==r.user_id, Task.date==today, Task.auto_key==ak).first()
+                if not dup:
+                    t = Task(
+                        user_id=r.user_id, date=today, text=title,
+                        task_type=r.type, direction_id=r.direction_id,
+                        supplier_id=r.supplier_id,
+                        priority=("medium" if r.type=="todo" else "high"),
+                        auto_key=ak, category="Личное", subcategory=""
+                    )
+                    sess.add(t)
+        sess.commit()
+    finally:
+        sess.close()
 
 # --------- Schedulers ---------
 def job_daily_digest():
@@ -859,7 +1504,7 @@ def job_daily_digest():
             if not tasks: continue
             text = f"📅 План на {dstr(today)}\n\n" + format_grouped(tasks, header_date=dstr(today))
             try:
-                bot.send_message(u.id, text)
+                send_safe(text, u.id)
             except Exception as e:
                 log.error("digest send error: %s", e)
     finally:
@@ -876,11 +1521,11 @@ def job_check_reminders():
                .all())
         for r in due:
             t = sess.query(Task).filter(Task.id==r.task_id, Task.user_id==r.user_id).first()
-            if not t: 
+            if not t:
                 r.fired = True
                 continue
             try:
-                bot.send_message(r.user_id, f"🔔 Напоминание: {t.text} (до {tstr(t.deadline)})")
+                send_safe(f"🔔 Напоминание: {t.text} (до {tstr(t.deadline)})", r.user_id)
             except Exception as e:
                 log.error("reminder send error: %s", e)
             r.fired = True
@@ -888,13 +1533,32 @@ def job_check_reminders():
     finally:
         sess.close()
 
+def job_orchestrator_minutely():
+    global LAST_TICK
+    LAST_TICK = datetime.utcnow()
+    job_check_reminders()
+    job_rules_tick()
+
 def scheduler_loop():
     schedule.clear()
     schedule.every().day.at("08:00").do(job_daily_digest)
-    schedule.every(1).minutes.do(job_check_reminders)
+    schedule.every(1).minutes.do(job_orchestrator_minutely)
     while True:
         schedule.run_pending()
         time.sleep(1)
+
+# --------- /health ---------
+@bot.message_handler(commands=["health"])
+def cmd_health(m):
+    if ADMIN_IDS and m.from_user and m.from_user.id not in ADMIN_IDS:
+        return
+    sess = SessionLocal()
+    try:
+        rc = sess.query(Rule).filter(Rule.active==True).count()
+    finally:
+        sess.close()
+    lt = LAST_TICK.isoformat() if LAST_TICK else "—"
+    send_safe(f"✅ OK\nLast tick: {lt}\nActive rules: {rc}\nTZ: {TZ_NAME}", m.chat.id)
 
 # --------- START (polling) ---------
 if __name__ == "__main__":
@@ -906,7 +1570,7 @@ if __name__ == "__main__":
     log.info("Starting polling…")
     while True:
         try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=50, skip_pending=True)
+            bot.infinity_polling(timeout=60, long_polling_timeout=50, skip_pending=True, allowed_updates=["message","callback_query"])
         except Exception as e:
             log.error("polling error: %s — retry in 3s", e)
             time.sleep(3)
