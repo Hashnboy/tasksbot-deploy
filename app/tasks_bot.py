@@ -25,7 +25,7 @@ from sqlalchemy import (
     create_engine, Column, Integer, String, Text, Date, Time, DateTime, Boolean,
     ForeignKey, func, UniqueConstraint, and_, or_
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 
 # --------- ENV / LOG ---------
 API_TOKEN   = os.getenv("TELEGRAM_TOKEN")
@@ -69,7 +69,7 @@ class Task(Base):
     )
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, index=True, nullable=False)
-    assignee_id = Column(Integer, nullable=True)  # делегировано кому (chat id), если None — самому себе
+    assignee_id = Column(Integer, nullable=True)  # делегировано кому (chat id)
     date = Column(Date, index=True, nullable=False)
     category = Column(String(120), default="Личное", index=True)
     subcategory = Column(String(120), default="", index=True)  # ТТ/локация
@@ -333,7 +333,6 @@ def ai_parse_items(text, uid):
             return out
         except Exception as e:
             log.warning("AI parse fail: %s", e)
-    # fallback эвристики
     tl = text.lower()
     cat = "Кофейня" if any(x in tl for x in ["кофейн","к-экспро","вылегжан"]) else ("Табачка" if "табач" in tl else "Личное")
     sub = "Центр" if "центр" in tl else ("Полет" if ("полет" in tl or "полёт" in tl) else ("Климово" if "климов" in tl else ""))
@@ -723,7 +722,6 @@ def cb(c):
             tid = int(data.get("id"))
             t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
             if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
-            # проверим зависимости
             deps = sess.query(Dependency).filter(Dependency.task_id==t.id).all()
             if deps:
                 undone = sess.query(Task).filter(Task.id.in_([d.depends_on_id for d in deps]),
