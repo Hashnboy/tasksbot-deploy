@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 TasksBot (polling, PostgreSQL)
-- Telegram via pyTelegramBotAPI (TeleBot)
+- pyTelegramBotAPI (TeleBot)
 - Полный функционал: задачи, группы, поставщики/циклы, повторяемость, напоминания
+- Профиль / Зависимости / Делегирование (базовые каркасы)
 - SQLAlchemy (PostgreSQL)
 - GPT (опционально): OPENAI_API_KEY
-Env: TELEGRAM_TOKEN, DATABASE_URL, TZ (Europe/Moscow по умолчанию)
+
+ENV: TELEGRAM_TOKEN, DATABASE_URL, TZ (Europe/Moscow по умолчанию)
 """
 
 import os, re, json, time, hmac, hashlib, logging, threading
@@ -96,6 +98,22 @@ class Reminder(Base):
     fired = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
 
+# --- новые таблицы (зависимости/делегирование) ---
+class TaskLink(Base):
+    __tablename__ = "task_links"
+    id        = Column(Integer, primary_key=True)
+    parent_id = Column(Integer, index=True)
+    child_id  = Column(Integer, index=True)
+    kind      = Column(String(40), default="blocks")  # blocks | relates
+
+class Assignee(Base):
+    __tablename__ = "assignees"
+    id        = Column(Integer, primary_key=True)
+    task_id   = Column(Integer, index=True)
+    user_id   = Column(Integer, index=True)  # chat_id другого пользователя
+    role      = Column(String(40), default="owner")    # owner|delegate
+    created_at= Column(DateTime, server_default=func.now())
+
 Base.metadata.create_all(bind=engine)
 
 # --------- BOT ---------
@@ -145,10 +163,6 @@ BASE_SUP_RULES = {
 }
 def norm_sup(name:str): return (name or "").strip().lower()
 
-def is_order_task_text(txt: str):
-    tl = (txt or "").lower()
-    return ("заказать" in tl) or ("заказ " in tl) or (tl.startswith("📦") and "заказ" in tl) or ("закуп" in tl)
-
 def load_rule(sess, supplier_name:str):
     s = sess.query(Supplier).filter(func.lower(Supplier.name)==norm_sup(supplier_name)).first()
     if s and s.active:
@@ -167,28 +181,26 @@ def plan_next(sess, user_id:int, supplier:str, category:str, subcategory:str):
     if not rule: return []
     today = now_local().date()
     out = []
-
-    def ensure_task(d, text, tm):
-        q = (sess.query(Task)
-             .filter(Task.user_id==user_id, Task.date==d,
-                     Task.category==category, Task.subcategory==subcategory,
-                     Task.text==text, Task.is_repeating==False))
-        if not q.first():
-            sess.add(Task(user_id=user_id, date=d, category=category, subcategory=subcategory,
-                          text=text, deadline=tm, is_repeating=False, source=f"auto:{supplier}"))
-
     if rule["kind"]=="cycle_every_n_days":
         delivery = today + timedelta(days=rule["delivery_offset"])
         next_order = today + timedelta(days=rule["n_days"])
-        ensure_task(delivery, f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})", parse_time("10:00"))
-        ensure_task(next_order, f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})", parse_time(rule["deadline"]))
+        sess.merge(Task(user_id=user_id, date=delivery, category=category, subcategory=subcategory,
+                        text=f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})",
+                        deadline=parse_time("10:00")))
+        sess.merge(Task(user_id=user_id, date=next_order, category=category, subcategory=subcategory,
+                        text=f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})",
+                        deadline=parse_time(rule["deadline"])))
         sess.commit()
         out = [("delivery", delivery), ("order", next_order)]
     else:
         delivery = today + timedelta(days=rule["delivery_offset"])
         next_order = delivery + timedelta(days=max(1, (rule.get("shelf_days",3)-1)))
-        ensure_task(delivery, f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})", parse_time("11:00"))
-        ensure_task(next_order, f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})", parse_time(rule["deadline"]))
+        sess.merge(Task(user_id=user_id, date=delivery, category=category, subcategory=subcategory,
+                        text=f"{rule['emoji']} Принять поставку {supplier} ({subcategory or '—'})",
+                        deadline=parse_time("11:00")))
+        sess.merge(Task(user_id=user_id, date=next_order, category=category, subcategory=subcategory,
+                        text=f"{rule['emoji']} Заказать {supplier} ({subcategory or '—'})",
+                        deadline=parse_time(rule["deadline"])))
         sess.commit()
         out = [("delivery", delivery), ("order", next_order)]
     return out
@@ -197,6 +209,7 @@ def plan_next(sess, user_id:int, supplier:str, category:str, subcategory:str):
 def rule_hits_date(rule_text:str, created_at:datetime, target:date, template_deadline: dtime|None) -> dtime|None:
     if not rule_text: return None
     rl = rule_text.strip().lower()
+    # каждые N дней
     if rl.startswith("каждые"):
         m = re.findall(r"\d+", rl)
         n = int(m[0]) if m else 1
@@ -205,6 +218,7 @@ def rule_hits_date(rule_text:str, created_at:datetime, target:date, template_dea
         if delta >= 0 and delta % n == 0:
             return template_deadline
         return None
+    # каждый вторник 12:00
     if rl.startswith("каждый"):
         days = {"пн":0,"вт":1,"ср":2,"чт":3,"пт":4,"сб":5,"вс":6,
                 "понедельник":0,"вторник":1,"среда":2,"четверг":3,"пятница":4,"суббота":5,"воскресенье":6}
@@ -212,9 +226,11 @@ def rule_hits_date(rule_text:str, created_at:datetime, target:date, template_dea
         for k,v in days.items():
             if f" {k}" in f" {rl}":
                 wd = v; break
-        if wd is None or target.weekday() != wd: return None
+        if wd is None or target.weekday()!=wd:
+            return None
         tm = re.search(r"(\d{1,2}:\d{2})", rl)
         return parse_time(tm.group(1)) if tm else template_deadline
+    # по пн,ср[,...]
     if rl.startswith("по "):
         m = re.findall(r"(пн|вт|ср|чт|пт|сб|вс)", rl)
         mapd = {"пн":0,"вт":1,"ср":2,"чт":3,"пт":4,"сб":5,"вс":6}
@@ -294,10 +310,12 @@ def main_menu():
     kb.row("📅 Сегодня","📆 Неделя")
     kb.row("➕ Добавить","✅ Я сделал…","🧠 Ассистент")
     kb.row("🚚 Поставки","🔎 Найти")
+    kb.row("👤 Профиль","🧩 Зависимости","🤝 Делегирование")
     return kb
 
 # --------- NLP add ---------
 def ai_parse_items(text, uid):
+    # try OpenAI JSON
     if openai_client:
         try:
             sys = ("Ты парсер задач. Верни только JSON-массив объектов: "
@@ -325,6 +343,7 @@ def ai_parse_items(text, uid):
             return out
         except Exception as e:
             log.warning("AI parse fail: %s", e)
+    # fallback
     tl = text.lower()
     cat = "Кофейня" if any(x in tl for x in ["кофейн","к-экспро","вылегжан"]) else ("Табачка" if "табач" in tl else "Личное")
     sub = "Центр" if "центр" in tl else ("Полет" if ("полет" in tl or "полёт" in tl) else ("Климово" if "климов" in tl else ""))
@@ -349,10 +368,6 @@ def start(m):
     finally:
         sess.close()
     bot.send_message(m.chat.id, "Привет! Я твой ассистент по задачам.", reply_markup=main_menu())
-
-@bot.message_handler(commands=["help"])
-def help_cmd(m):
-    bot.send_message(m.chat.id, "Кнопки: 📅 Сегодня / 📆 Неделя / ➕ Добавить / ✅ Я сделал… / 🚚 Поставки / 🔎 Найти / 🧠 Ассистент", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda msg: msg.text == "📅 Сегодня")
 def today(m):
@@ -386,8 +401,8 @@ def week(m):
         by = {}
         for t in rows: by.setdefault(dstr(t.date), []).append(t)
         parts = []
-        for ds_ in sorted(by.keys(), key=lambda s: parse_date(s)):
-            parts.append(format_grouped(by[ds_], header_date=ds_)); parts.append("")
+        for ds in sorted(by.keys(), key=lambda s: parse_date(s)):
+            parts.append(format_grouped(by[ds], header_date=ds)); parts.append("")
         bot.send_message(uid, "\n".join(parts), reply_markup=main_menu())
     finally:
         sess.close()
@@ -438,7 +453,7 @@ def done_text(m):
         for t in rows:
             if t.status=="выполнено": continue
             low = (t.text or "").lower()
-            is_order = is_order_task_text(low)
+            is_order = ("заказ" in low or "закуп" in low)
             if supplier:
                 if norm_sup(supplier) not in norm_sup(low): continue
                 if not is_order: continue
@@ -454,6 +469,7 @@ def done_text(m):
     finally:
         sess.close()
 
+# ---- Поставки ----
 @bot.message_handler(func=lambda msg: msg.text == "🚚 Поставки")
 def supplies_menu(m):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -461,13 +477,17 @@ def supplies_menu(m):
     kb.row("⬅️ Назад")
     bot.send_message(m.chat.id, "Меню поставок:", reply_markup=kb)
 
+@bot.message_handler(func=lambda msg: msg.text == "⬅️ Назад")
+def back_to_main(m):
+    bot.send_message(m.chat.id, "Ок.", reply_markup=main_menu())
+
 @bot.message_handler(func=lambda msg: msg.text == "📦 Заказы сегодня")
 def orders_today(m):
     sess = SessionLocal()
     try:
         uid = m.chat.id
         rows = tasks_for_date(sess, uid, now_local().date())
-        orders = [t for t in rows if is_order_task_text(t.text)]
+        orders = [t for t in rows if "заказ" in (t.text or "").lower()]
         if not orders:
             bot.send_message(uid, "На сегодня заказов нет.", reply_markup=main_menu()); return
         items = [(short_line(t, i), t.id) for i,t in enumerate(orders, start=1)]
@@ -503,6 +523,7 @@ def add_supplier_parse(m):
     finally:
         sess.close()
 
+# ---- Поиск ----
 @bot.message_handler(func=lambda msg: msg.text == "🔎 Найти")
 def search_prompt(m):
     sent = bot.send_message(m.chat.id, "Что ищем? (текст, категория/подкатегория или дата ДД.ММ.ГГГГ)")
@@ -529,12 +550,13 @@ def do_search(m):
         by = {}
         for t in rows: by.setdefault(dstr(t.date), []).append(t)
         parts = []
-        for ds_ in sorted(by.keys(), key=lambda s: parse_date(s)):
-            parts.append(format_grouped(by[ds_], header_date=ds_)); parts.append("")
+        for ds in sorted(by.keys(), key=lambda s: parse_date(s)):
+            parts.append(format_grouped(by[ds], header_date=ds)); parts.append("")
         bot.send_message(uid, "\n".join(parts), reply_markup=main_menu())
     finally:
         sess.close()
 
+# ---- Ассистент ----
 @bot.message_handler(func=lambda msg: msg.text == "🧠 Ассистент")
 def assistant(m):
     sent = bot.send_message(m.chat.id, "Спроси меня о приоритете/плане. Я учту твою неделю.", reply_markup=main_menu())
@@ -567,11 +589,67 @@ def assistant_answer(m):
     finally:
         sess.close()
 
-@bot.message_handler(func=lambda m: m.text == "⬅️ Назад")
-def back_to_main(m):
-    bot.send_message(m.chat.id, "Главное меню:", reply_markup=main_menu())
+# ---- Профиль / Зависимости / Делегирование ----
+@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
+def profile(m):
+    sess = SessionLocal()
+    try:
+        u = ensure_user(sess, m.chat.id)
+        bot.send_message(m.chat.id, f"ID: {u.id}\nИмя: {u.name or '—'}\nЧасовой пояс: {TZ_NAME}", reply_markup=main_menu())
+    finally:
+        sess.close()
 
-# --------- Callbacks ---------
+@bot.message_handler(func=lambda m: m.text == "🧩 Зависимости")
+def deps_menu(m):
+    bot.send_message(m.chat.id,
+        "Пока базово: пришли 'parent_id -> child_id', я свяжу задачи.\nНапр.: 12 -> 34",
+        reply_markup=main_menu())
+    bot.register_next_step_handler_by_chat_id(m.chat.id, deps_parse)
+
+def deps_parse(m):
+    sess = SessionLocal()
+    try:
+        uid = m.chat.id
+        m_ = re.match(r"\s*(\d+)\s*->\s*(\d+)", (m.text or ""))
+        if not m_: 
+            bot.send_message(uid, "Формат: 12 -> 34", reply_markup=main_menu()); return
+        p, c = int(m_.group(1)), int(m_.group(2))
+        sess.add(TaskLink(parent_id=p, child_id=c, kind="blocks"))
+        sess.commit()
+        bot.send_message(uid, "✅ Связано.", reply_markup=main_menu())
+    finally:
+        sess.close()
+
+@bot.message_handler(func=lambda m: m.text == "🤝 Делегирование")
+def delegate_prompt(m):
+    bot.send_message(m.chat.id,
+        "Отправь: task_id; chat_id_исполнителя.\nНапр.: 25; 123456789",
+        reply_markup=main_menu())
+    bot.register_next_step_handler_by_chat_id(m.chat.id, delegate_save)
+
+def delegate_save(m):
+    sess = SessionLocal()
+    try:
+        uid = m.chat.id
+        parts = [x.strip() for x in (m.text or "").split(";")]
+        if len(parts) < 2: 
+            bot.send_message(uid, "Формат: task_id; chat_id", reply_markup=main_menu()); return
+        task_id, other = int(parts[0]), int(parts[1])
+        t = sess.query(Task).filter(Task.id==task_id, Task.user_id==uid).first()
+        if not t:
+            bot.send_message(uid, "Задача не найдена.", reply_markup=main_menu()); return
+        sess.add(Assignee(task_id=task_id, user_id=other, role="delegate"))
+        sess.commit()
+        # пинганем исполнителя (может не сработать, если он ещё не писал боту)
+        try:
+            bot.send_message(other, f"Вам делегирована задача #{task_id}: {t.text} на {dstr(t.date)}")
+        except Exception:
+            pass
+        bot.send_message(uid, "✅ Делегировано.", reply_markup=main_menu())
+    finally:
+        sess.close()
+
+# --------- Callbacks (карточки, пагинация, действия) ---------
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
     data = parse_cb(c.data) if c.data and c.data!="noop" else None
