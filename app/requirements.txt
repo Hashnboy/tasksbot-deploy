@@ -11,3 +11,7 @@ aiogram>=3.4
 SQLAlchemy>=2.0
 psycopg2-binary>=2.9
 gunicorn>=23.0
+psycopg2-binary
+pytz
+schedule
+openai
