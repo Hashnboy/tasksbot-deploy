@@ -213,11 +213,18 @@ migrate_db()
 
 # --------- BOT ---------
 bot = TeleBot(API_TOKEN, parse_mode="HTML")
-PAGE = 8
 from org_ext import OrgExt
-org = OrgExt(bot)   # можно передать твои engine/SessionLocal, если уже есть
-org.init_db()       # создаст таблицы, точки, и зальёт шаблоны отчётов
-org.register()      # повесит хендлеры: приглашения/роли, чек-ин/аут, отчёты, настройки, статистика
+from ops_ext import OpsExt
+
+org = OrgExt(bot)   # можно передать свой engine/SessionLocal, если у тебя уже есть
+org.init_db()       # создаст таблицы org_, точки и отчётные шаблоны
+org.register()      # зарегистрирует хендлеры /start, /join, отчётность, чек-ин/аут, админ-меню
+
+ops = OpsExt(bot)   # контур перемещений
+ops.init_db()       # создаст таблицы ops_
+ops.register()      # зарегистрирует /ops и всё по перемещениям
+
+PAGE = 8  # повесит хендлеры: приглашения/роли, чек-ин/аут, отчёты, настройки, статистика
 LAST_TICK: Optional[datetime] = None
 
 # --------- Utils ---------
