@@ -34,6 +34,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session, relationship
 
+from directions import registry as dir_registry
+
 # --------- ENV / LOG ---------
 API_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 DB_URL      = os.getenv("DATABASE_URL")
@@ -49,6 +51,9 @@ LOCAL_TZ = pytz.timezone(TZ_NAME)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("tasksbot")
 log.info("Boot TasksBot v2025-08-21-rules-ui")
+
+# загрузим направления при старте
+dir_registry.load_all()
 
 # --------- OpenAI (optional) ---------
 openai_client = None
@@ -75,9 +80,21 @@ class User(Base):
 class Direction(Base):
     __tablename__ = "directions"
     id = Column(Integer, primary_key=True)
+    key = Column(String(50), unique=True, nullable=False)
     name = Column(String(120), unique=True, nullable=False)
     emoji = Column(String(8), default="📂")
     sort_order = Column(Integer, default=100)
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    last_direction = Column(Integer, ForeignKey("directions.id", ondelete="SET NULL"), nullable=True)
+    last_point = Column(Integer, nullable=True)
+    list_page_size = Column(Integer, default=8)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    direction = relationship("Direction", lazy="joined")
 
 class Supplier(Base):
     __tablename__ = "suppliers"
@@ -209,7 +226,29 @@ BEGIN
   END IF;
 END $$;
 """)
+def migrate_db_directions():
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "ALTER TABLE directions ADD COLUMN IF NOT EXISTS key VARCHAR(50);",
+        )
+        conn.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS user_settings ("\
+            "user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, "\
+            "last_direction INT NULL REFERENCES directions(id) ON DELETE SET NULL, "\
+            "last_point INT NULL, "\
+            "list_page_size INT NOT NULL DEFAULT 8, "\
+            "created_at TIMESTAMP DEFAULT now(), "\
+            "updated_at TIMESTAMP DEFAULT now() "\
+            ");",
+        )
+        for d in dir_registry.all_directions():
+            conn.exec_driver_sql(
+                f"INSERT INTO directions(key,name) VALUES ('{d.key}','{d.display_name_ru}') "
+                "ON CONFLICT (key) DO NOTHING;"
+            )
+
 migrate_db()
+migrate_db_directions()
 
 # --------- BOT ---------
 bot = TeleBot(API_TOKEN, parse_mode="HTML")
@@ -264,6 +303,79 @@ def ensure_user(sess, uid, name="", tz=None):
         u = User(id=uid, name=name or "", tz=tz or TZ_NAME)
         sess.add(u); sess.commit()
     return u
+
+
+def ensure_user_settings(sess, uid):
+    us = sess.get(UserSettings, uid)
+    if not us:
+        us = UserSettings(user_id=uid)
+        sess.add(us)
+        sess.commit()
+    return us
+
+
+def show_directions_menu(chat_id: int):
+    with SessionLocal() as sess:
+        us = ensure_user_settings(sess, chat_id)
+        last_key = None
+        if us.last_direction:
+            d = sess.query(Direction).filter_by(id=us.last_direction).first()
+            last_key = d.key if d else None
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for d in dir_registry.all_directions():
+        star = "⭐ " if last_key == d.key else ""
+        markup.add(types.InlineKeyboardButton(f"{star}{d.display_name_ru}", callback_data=mk_cb("dir_sel", key=d.key)))
+    send_safe("Выберите направление:", chat_id, reply_markup=markup)
+
+
+def show_direction_menu(chat_id: int, key: str):
+    direction = dir_registry.get(key)
+    if not direction:
+        send_safe("Неизвестное направление", chat_id)
+        return
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for sec in direction.get_menu_sections(None):
+        markup.add(types.InlineKeyboardButton(sec.text, callback_data=mk_cb("dir_act", key=key, action=sec.callback)))
+    markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("home")))
+    send_safe(direction.display_name_ru, chat_id, reply_markup=markup)
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(m):
+    with SessionLocal() as sess:
+        ensure_user(sess, m.chat.id, m.from_user.full_name if m.from_user else "")
+        ensure_user_settings(sess, m.chat.id)
+    show_directions_menu(m.chat.id)
+
+
+@bot.callback_query_handler(func=lambda c: parse_cb(c.data) and parse_cb(c.data).get("a") == "home")
+def cb_home(c):
+    show_directions_menu(c.message.chat.id)
+    bot.answer_callback_query(c.id)
+
+
+@bot.callback_query_handler(func=lambda c: parse_cb(c.data) and parse_cb(c.data).get("a") == "dir_sel")
+def cb_dir_sel(c):
+    data = parse_cb(c.data)
+    key = data.get("key")
+    with SessionLocal() as sess:
+        ensure_user(sess, c.from_user.id, c.from_user.full_name if c.from_user else "")
+        us = ensure_user_settings(sess, c.from_user.id)
+        d = sess.query(Direction).filter_by(key=key).first()
+        if d:
+            us.last_direction = d.id
+            sess.commit()
+    show_direction_menu(c.message.chat.id, key)
+    bot.answer_callback_query(c.id)
+
+
+@bot.callback_query_handler(func=lambda c: parse_cb(c.data) and parse_cb(c.data).get("a") == "dir_act")
+def cb_dir_act(c):
+    data = parse_cb(c.data)
+    key = data.get("key")
+    action = data.get("action")
+    send_safe(f"[{key}] {action} — в разработке", c.message.chat.id)
+    bot.answer_callback_query(c.id)
 
 # безопасная отправка (бэкофф)
 def send_safe(text, chat_id, **kwargs):
