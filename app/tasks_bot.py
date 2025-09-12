@@ -20,7 +20,7 @@ Env:
   CALLBACK_SECRET (обязательно для подписи), ADMIN_IDS (опц., кому доступен /health)
 """
 
-import os, re, json, time, hmac, hashlib, logging, threading
+import os, re, json, time, logging, threading
 from datetime import datetime, timedelta, date, time as dtime
 from typing import Optional
 
@@ -28,6 +28,7 @@ import pytz
 import schedule
 
 from telebot import TeleBot, types, apihelper
+from callbacks import mk_cb, parse_cb
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, Date, Time, DateTime, Boolean,
     ForeignKey, func, UniqueConstraint, Index, and_, or_
@@ -226,6 +227,7 @@ ops.register()      # зарегистрирует /ops и всё по пере�
 
 PAGE = 8  # повесит хендлеры: приглашения/роли, чек-ин/аут, отчёты, настройки, статистика
 LAST_TICK: Optional[datetime] = None
+PROCESSED_CBS: dict[str, float] = {}
 
 # --------- Utils ---------
 def now_local():
@@ -239,24 +241,6 @@ def parse_time(s): return datetime.strptime(s, "%H:%M").time()
 def weekday_ru(d: date):
     names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
     return names[d.weekday()]
-
-def _cb_sign(s:str)->str:
-    return hashlib.sha1(CALLBACK_SECRET + s.encode("utf-8")).hexdigest()[:6]
-
-def mk_cb(action, **kwargs):
-    payload = {"v":1, "a": action, **kwargs}
-    s = json.dumps(payload, ensure_ascii=False, separators=(",",":"))
-    sig = _cb_sign(s)
-    return f"{sig}|{s}"
-
-def parse_cb(data):
-    try:
-        sig, s = data.split("|", 1)
-        if _cb_sign(s) != sig:
-            return None
-        return json.loads(s)
-    except Exception:
-        return None
 
 def ensure_user(sess, uid, name="", tz=None):
     u = sess.query(User).filter_by(id=uid).first()
@@ -801,117 +785,170 @@ def deps_set(m):
         sess.close()
 
 # ----- Callbacks (карточки) -----
-@bot.callback_query_handler(func=lambda c: True)
+TASK_ACTIONS = {"open", "mv", "page", "done", "del", "setdl", "rem", "sub", "dlg"}
+
+
+def _task_cb_filter(c):
+    data = parse_cb(c.data) if c.data else None
+    return bool(data and data.get("a") in TASK_ACTIONS)
+
+
+@bot.callback_query_handler(func=_task_cb_filter)
 def cb(c):
-    data = parse_cb(c.data) if c.data and c.data!="noop" else None
     uid = c.message.chat.id
+    now_ts = time.time()
+    if c.id in PROCESSED_CBS:
+        bot.answer_callback_query(c.id, "Устаревшая кнопка", show_alert=True)
+        return
+    PROCESSED_CBS[c.id] = now_ts
+    for k, v in list(PROCESSED_CBS.items()):
+        if now_ts - v > 60:
+            del PROCESSED_CBS[k]
+
+    data = parse_cb(c.data) if c.data else None
     if not data:
-        bot.answer_callback_query(c.id); return
+        bot.answer_callback_query(c.id, "Устаревшая кнопка", show_alert=True)
+        return
     a = data.get("a")
     sess = SessionLocal()
     try:
-        if a=="open":
+        if a == "open":
             tid = int(data.get("id"))
-            t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
-            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            t = sess.query(Task).filter(Task.id == tid, Task.user_id == uid).first()
+            if not t:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
+                return
             dl = tstr(t.deadline)
-            deps = sess.query(Dependency).filter(Dependency.task_id==t.id).all()
+            deps = sess.query(Dependency).filter(Dependency.task_id == t.id).all()
             dep_text = ""
             if deps:
                 dep_ids = [str(d.depends_on_id) for d in deps]
                 dep_text = f"\n🔗 Зависит от: {', '.join(dep_ids)}"
-            pr_emoji = {"high":"🔴","medium":"🟡","low":"🟢","future":"⏳"}.get(t.priority or "medium","🟡")
-            text = (f"<b>{t.text}</b>\n"
-                    f"📅 {weekday_ru(t.date)} — {dstr(t.date)}\n"
-                    f"📁 {t.category}/{t.subcategory or '—'}\n"
-                    f"⚑ Тип: {t.task_type or 'todo'}  • Приоритет: {pr_emoji}\n"
-                    f"⏰ Дедлайн: {dl}\n"
-                    f"📝 Статус: {t.status or '—'}{dep_text}")
+            pr_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢", "future": "⏳"}.get(t.priority or "medium", "🟡")
+            text = (
+                f"<b>{t.text}</b>\n"
+                f"📅 {weekday_ru(t.date)} — {dstr(t.date)}\n"
+                f"📁 {t.category}/{t.subcategory or '—'}\n"
+                f"⚑ Тип: {t.task_type or 'todo'}  • Приоритет: {pr_emoji}\n"
+                f"⏰ Дедлайн: {dl}\n"
+                f"📝 Статус: {t.status or '—'}{dep_text}"
+            )
             kb = types.InlineKeyboardMarkup()
-            kb.row(types.InlineKeyboardButton("✅ Выполнить", callback_data=mk_cb("done", id=tid)),
-                   types.InlineKeyboardButton("🗑 Удалить", callback_data=mk_cb("del", id=tid)))
-            kb.row(types.InlineKeyboardButton("✏️ Дедлайн", callback_data=mk_cb("setdl", id=tid)),
-                   types.InlineKeyboardButton("⏰ Напоминание", callback_data=mk_cb("rem", id=tid)))
-            # быстрый перенос (минимум)
-            kb.row(types.InlineKeyboardButton("📤 Сегодня", callback_data=mk_cb("mv", id=tid, to="today")),
-                   types.InlineKeyboardButton("📤 Завтра",  callback_data=mk_cb("mv", id=tid, to="tomorrow")),
-                   types.InlineKeyboardButton("📤 +1д",     callback_data=mk_cb("mv", id=tid, to="+1")))
+            kb.row(
+                types.InlineKeyboardButton("✅ Выполнить", callback_data=mk_cb("done", id=tid)),
+                types.InlineKeyboardButton("🗑 Удалить", callback_data=mk_cb("del", id=tid)),
+            )
+            kb.row(
+                types.InlineKeyboardButton("✏️ Дедлайн", callback_data=mk_cb("setdl", id=tid)),
+                types.InlineKeyboardButton("⏰ Напоминание", callback_data=mk_cb("rem", id=tid)),
+            )
+            kb.row(
+                types.InlineKeyboardButton("📤 Сегодня", callback_data=mk_cb("mv", id=tid, to="today")),
+                types.InlineKeyboardButton("📤 Завтра", callback_data=mk_cb("mv", id=tid, to="tomorrow")),
+                types.InlineKeyboardButton("📤 +1д", callback_data=mk_cb("mv", id=tid, to="+1")),
+            )
             bot.answer_callback_query(c.id)
             bot.send_message(uid, text, reply_markup=kb)
             return
-        if a=="mv":
-            tid = int(data.get("id")); to = data.get("to")
-            t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
-            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+        if a == "mv":
+            tid = int(data.get("id"))
+            to = data.get("to")
+            t = sess.query(Task).filter(Task.id == tid, Task.user_id == uid).first()
+            if not t:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
+                return
             base = now_local().date()
-            if to=="today": t.date = base
-            elif to=="tomorrow": t.date = base + timedelta(days=1)
-            elif to=="+1": t.date = t.date + timedelta(days=1)
+            if to == "today":
+                t.date = base
+            elif to == "tomorrow":
+                t.date = base + timedelta(days=1)
+            elif to == "+1":
+                t.date = t.date + timedelta(days=1)
             sess.commit()
-            bot.answer_callback_query(c.id, "Перенесено"); return
-        if a=="page":
+            bot.answer_callback_query(c.id, "Перенесено")
+            return
+        if a == "page":
             rows = tasks_for_date(sess, uid, now_local().date())
-            items = [(short_line(t, i), t.id) for i,t in enumerate(rows, start=1)]
-            page = int(data.get("p",1))
-            total = (len(items)+PAGE-1)//PAGE or 1
+            items = [(short_line(t, i), t.id) for i, t in enumerate(rows, start=1)]
+            page = int(data.get("p", 1))
+            total = (len(items) + PAGE - 1) // PAGE or 1
             page = max(1, min(page, total))
-            slice_items = items[(page-1)*PAGE:page*PAGE]
+            slice_items = items[(page - 1) * PAGE : page * PAGE]
             kb = page_kb(slice_items, page, total, "open")
             try:
                 bot.edit_message_reply_markup(uid, c.message.message_id, reply_markup=kb)
             except Exception:
                 pass
-            bot.answer_callback_query(c.id); return
-        if a=="done":
+            bot.answer_callback_query(c.id)
+            return
+        if a == "done":
             tid = int(data.get("id"))
-            t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
-            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
-            deps = sess.query(Dependency).filter(Dependency.task_id==t.id).all()
+            t = sess.query(Task).filter(Task.id == tid, Task.user_id == uid).first()
+            if not t:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
+                return
+            deps = sess.query(Dependency).filter(Dependency.task_id == t.id).all()
             if deps:
-                undone = sess.query(Task).filter(Task.id.in_([d.depends_on_id for d in deps]),
-                                                 Task.status!="выполнено").count()
-                if undone>0:
-                    bot.answer_callback_query(c.id, "Есть невыполненные зависимости.", show_alert=True); return
-            t.status = "выполнено"; sess.commit()
+                undone = (
+                    sess.query(Task)
+                    .filter(Task.id.in_([d.depends_on_id for d in deps]), Task.status != "выполнено")
+                    .count()
+                )
+                if undone > 0:
+                    bot.answer_callback_query(c.id, "Есть невыполненные зависимости.", show_alert=True)
+                    return
+            t.status = "выполнено"
+            sess.commit()
             sup = ""
             low = (t.text or "").lower()
-            if any(x in low for x in ["к-экспро","k-exp","к экспро"]): sup="К-Экспро"
-            if "вылегжан" in low: sup="ИП Вылегжанина"
+            if any(x in low for x in ["к-экспро", "k-exp", "к экспро"]):
+                sup = "К-Экспро"
+            if "вылегжан" in low:
+                sup = "ИП Вылегжанина"
             msg = "✅ Готово."
             if sup:
                 created = plan_next(sess, uid, sup, t.category, t.subcategory)
-                if created: msg += " Запланирована приемка/следующий заказ."
-            bot.answer_callback_query(c.id, msg, show_alert=True); return
-        if a=="del":
+                if created:
+                    msg += " Запланирована приемка/следующий заказ."
+            bot.answer_callback_query(c.id, msg, show_alert=True)
+            return
+        if a == "del":
             tid = int(data.get("id"))
-            t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
-            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
-            sess.delete(t); sess.commit()
-            bot.answer_callback_query(c.id, "Удалено", show_alert=True); return
-        if a=="setdl":
+            t = sess.query(Task).filter(Task.id == tid, Task.user_id == uid).first()
+            if not t:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
+                return
+            sess.delete(t)
+            sess.commit()
+            bot.answer_callback_query(c.id, "Удалено", show_alert=True)
+            return
+        if a == "setdl":
             tid = int(data.get("id"))
             bot.answer_callback_query(c.id)
             sent = bot.send_message(uid, "Введи время в формате ЧЧ:ММ")
             bot.register_next_step_handler(sent, set_deadline_text, tid)
             return
-        if a=="rem":
+        if a == "rem":
             tid = int(data.get("id"))
             bot.answer_callback_query(c.id)
             sent = bot.send_message(uid, "Введи напоминание: ДД.ММ.ГГГГ ЧЧ:ММ")
             bot.register_next_step_handler(sent, add_reminder_text, tid)
             return
-        if a=="sub":
+        if a == "sub":
             tid = int(data.get("id"))
             bot.answer_callback_query(c.id)
             sent = bot.send_message(uid, "Текст подзадачи:")
             bot.register_next_step_handler(sent, add_subtask_text, tid)
             return
-        if a=="dlg":
+        if a == "dlg":
             tid = int(data.get("id"))
             bot.answer_callback_query(c.id)
             sent = bot.send_message(uid, "Кому делегировать? Введи chat_id получателя.")
             bot.register_next_step_handler(sent, delegate_to_user, tid)
             return
+    except Exception:
+        log.exception("callback error", extra={"uid": uid, "data": c.data})
+        bot.answer_callback_query(c.id, "Ошибка, попробуйте позже", show_alert=True)
     finally:
         sess.close()
 
