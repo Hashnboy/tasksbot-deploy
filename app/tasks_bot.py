@@ -395,14 +395,17 @@ def format_grouped(tasks, header_date=None):
         out.append(line)
     return "\n".join(out)
 
-def page_kb(items, page, total, action="open"):
+def page_kb(items, page, total, action="t_open"):
+    prefix = action.split("_",1)[0]
     kb = types.InlineKeyboardMarkup()
     for label, tid in items:
         kb.add(types.InlineKeyboardButton(label, callback_data=mk_cb(action, id=tid)))
     nav = []
-    if page>1: nav.append(types.InlineKeyboardButton("⬅️", callback_data=mk_cb("page", p=page-1, pa=action)))
+    if page>1:
+        nav.append(types.InlineKeyboardButton("⬅️", callback_data=mk_cb(f"{prefix}_page", p=page-1, pa=action)))
     nav.append(types.InlineKeyboardButton(f"{page}/{total}", callback_data="noop"))
-    if page<total: nav.append(types.InlineKeyboardButton("➡️", callback_data=mk_cb("page", p=page+1, pa=action)))
+    if page<total:
+        nav.append(types.InlineKeyboardButton("➡️", callback_data=mk_cb(f"{prefix}_page", p=page+1, pa=action)))
     if nav: kb.row(*nav)
     return kb
 
@@ -418,6 +421,55 @@ def tasks_for_week(sess, uid:int, base:date):
             .filter(Task.user_id==uid, Task.date.in_(days), Task.is_repeating==False)
             .order_by(Task.date.asc(), Task.category.asc(), Task.subcategory.asc(), Task.deadline.asc().nulls_last())
             ).all()
+
+def send_tasks_for_day(uid:int, target:date):
+    sess = SessionLocal()
+    try:
+        expand_repeats_for_date(sess, uid, target)
+        rows = tasks_for_date(sess, uid, target)
+        if not rows:
+            bot.send_message(uid, f"📅 Задачи на {dstr(target)}\n\nЗадач нет.", reply_markup=main_menu()); return
+        items = [(short_line(t, i), t.id) for i, t in enumerate(rows, start=1)]
+        total = (len(items)+PAGE-1)//PAGE or 1
+        kb = page_kb(items[:PAGE], 1, total, "t_open")
+        header = (f"📅 Задачи на {dstr(target)}\n\n" +
+                  format_grouped(rows, header_date=dstr(target)) +
+                  "\n\nОткрой карточку:")
+        bot.send_message(uid, header, reply_markup=main_menu())
+        bot.send_message(uid, "Навигация по задачам:", reply_markup=kb)
+    finally:
+        sess.close()
+
+def send_task_card(uid:int, t:Task, sess):
+    dl = tstr(t.deadline)
+    deps = sess.query(Dependency).filter(Dependency.task_id==t.id).all()
+    dep_text = ""
+    if deps:
+        dep_ids = [str(d.depends_on_id) for d in deps]
+        dep_text = f"\n🔗 Зависит от: {', '.join(dep_ids)}"
+    pr_emoji = {"high":"🔴","medium":"🟡","low":"🟢","future":"⏳"}.get(t.priority or "medium","🟡")
+    text = (f"<b>{t.text}</b>\n"
+            f"📅 {weekday_ru(t.date)} — {dstr(t.date)}\n"
+            f"📁 {t.category}/{t.subcategory or '—'}\n"
+            f"⚑ Тип: {t.task_type or 'todo'}  • Приоритет: {pr_emoji}\n"
+            f"⏰ Дедлайн: {dl}\n"
+            f"📝 Статус: {t.status or '—'}{dep_text}")
+    subtasks = sess.query(Subtask).filter(Subtask.task_id==t.id).all()
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("✅ Выполнить", callback_data=mk_cb("t_done", id=t.id)),
+           types.InlineKeyboardButton("🗑 Удалить", callback_data=mk_cb("t_del", id=t.id)))
+    kb.row(types.InlineKeyboardButton("✏️ Дедлайн", callback_data=mk_cb("t_setdl", id=t.id)),
+           types.InlineKeyboardButton("⏰ Напоминание", callback_data=mk_cb("t_rem", id=t.id)))
+    kb.row(types.InlineKeyboardButton("📤 Сегодня", callback_data=mk_cb("t_mv", id=t.id, to="today")),
+           types.InlineKeyboardButton("📤 Завтра", callback_data=mk_cb("t_mv", id=t.id, to="tomorrow")),
+           types.InlineKeyboardButton("📤 +1д", callback_data=mk_cb("t_mv", id=t.id, to="+1")))
+    for st in subtasks:
+        icon = "✅" if st.status=="выполнено" else "⬜"
+        kb.add(types.InlineKeyboardButton(f"{icon} {st.text[:30]}", callback_data=mk_cb("s_open", id=st.id, pid=t.id)))
+    kb.row(types.InlineKeyboardButton("➕ Подзадача", callback_data=mk_cb("t_subadd", id=t.id)),
+           types.InlineKeyboardButton("🤝 Делегировать", callback_data=mk_cb("t_dlg", id=t.id)),
+           types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("t_back")))
+    bot.send_message(uid, text, reply_markup=kb)
 
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -488,21 +540,7 @@ def start(m):
 
 @bot.message_handler(func=lambda msg: msg.text == "📅 Сегодня")
 def today(m):
-    sess = SessionLocal()
-    try:
-        uid = m.chat.id
-        expand_repeats_for_date(sess, uid, now_local().date())
-        rows = tasks_for_date(sess, uid, now_local().date())
-        if not rows:
-            bot.send_message(uid, f"📅 Задачи на {dstr(now_local().date())}\n\nЗадач нет.", reply_markup=main_menu()); return
-        items = [(short_line(t, i), t.id) for i,t in enumerate(rows, start=1)]
-        total = (len(items)+PAGE-1)//PAGE or 1
-        kb = page_kb(items[:PAGE], 1, total, "open")
-        header = f"📅 Задачи на {dstr(now_local().date())}\n\n" + format_grouped(rows, header_date=dstr(now_local().date())) + "\n\nОткрой карточку:"
-        bot.send_message(uid, header, reply_markup=main_menu())
-        bot.send_message(uid, "Навигация по задачам:", reply_markup=kb)
-    finally:
-        sess.close()
+    send_tasks_for_day(m.chat.id, now_local().date())
 
 @bot.message_handler(func=lambda msg: msg.text == "📆 Неделя")
 def week(m):
@@ -611,7 +649,7 @@ def orders_today(m):
             bot.send_message(uid, "На сегодня заказов нет.", reply_markup=main_menu()); return
         items = [(short_line(t, i), t.id) for i,t in enumerate(orders, start=1)]
         total = (len(items)+PAGE-1)//PAGE or 1
-        kb = page_kb(items[:PAGE], 1, total, "open")
+        kb = page_kb(items[:PAGE], 1, total, "t_open")
         bot.send_message(uid, "Заказы на сегодня:", reply_markup=kb)
     finally:
         sess.close()
@@ -801,71 +839,51 @@ def deps_set(m):
         sess.close()
 
 # ----- Callbacks (карточки) -----
-@bot.callback_query_handler(func=lambda c: True)
-def cb(c):
-    data = parse_cb(c.data) if c.data and c.data!="noop" else None
+@bot.callback_query_handler(func=lambda c: c.data and parse_cb(c.data) and parse_cb(c.data).get("a","").startswith("t_"))
+def tasks_callbacks(c):
+    data = parse_cb(c.data)
     uid = c.message.chat.id
-    if not data:
-        bot.answer_callback_query(c.id); return
     a = data.get("a")
     sess = SessionLocal()
     try:
-        if a=="open":
+        if a == "t_open":
             tid = int(data.get("id"))
             t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
-            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
-            dl = tstr(t.deadline)
-            deps = sess.query(Dependency).filter(Dependency.task_id==t.id).all()
-            dep_text = ""
-            if deps:
-                dep_ids = [str(d.depends_on_id) for d in deps]
-                dep_text = f"\n🔗 Зависит от: {', '.join(dep_ids)}"
-            pr_emoji = {"high":"🔴","medium":"🟡","low":"🟢","future":"⏳"}.get(t.priority or "medium","🟡")
-            text = (f"<b>{t.text}</b>\n"
-                    f"📅 {weekday_ru(t.date)} — {dstr(t.date)}\n"
-                    f"📁 {t.category}/{t.subcategory or '—'}\n"
-                    f"⚑ Тип: {t.task_type or 'todo'}  • Приоритет: {pr_emoji}\n"
-                    f"⏰ Дедлайн: {dl}\n"
-                    f"📝 Статус: {t.status or '—'}{dep_text}")
-            kb = types.InlineKeyboardMarkup()
-            kb.row(types.InlineKeyboardButton("✅ Выполнить", callback_data=mk_cb("done", id=tid)),
-                   types.InlineKeyboardButton("🗑 Удалить", callback_data=mk_cb("del", id=tid)))
-            kb.row(types.InlineKeyboardButton("✏️ Дедлайн", callback_data=mk_cb("setdl", id=tid)),
-                   types.InlineKeyboardButton("⏰ Напоминание", callback_data=mk_cb("rem", id=tid)))
-            # быстрый перенос (минимум)
-            kb.row(types.InlineKeyboardButton("📤 Сегодня", callback_data=mk_cb("mv", id=tid, to="today")),
-                   types.InlineKeyboardButton("📤 Завтра",  callback_data=mk_cb("mv", id=tid, to="tomorrow")),
-                   types.InlineKeyboardButton("📤 +1д",     callback_data=mk_cb("mv", id=tid, to="+1")))
+            if not t:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
             bot.answer_callback_query(c.id)
-            bot.send_message(uid, text, reply_markup=kb)
+            send_task_card(uid, t, sess)
             return
-        if a=="mv":
+        if a == "t_mv":
             tid = int(data.get("id")); to = data.get("to")
             t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
-            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            if not t:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
             base = now_local().date()
             if to=="today": t.date = base
             elif to=="tomorrow": t.date = base + timedelta(days=1)
             elif to=="+1": t.date = t.date + timedelta(days=1)
             sess.commit()
             bot.answer_callback_query(c.id, "Перенесено"); return
-        if a=="page":
+        if a == "t_page":
             rows = tasks_for_date(sess, uid, now_local().date())
             items = [(short_line(t, i), t.id) for i,t in enumerate(rows, start=1)]
             page = int(data.get("p",1))
+            open_action = data.get("pa","t_open")
             total = (len(items)+PAGE-1)//PAGE or 1
             page = max(1, min(page, total))
             slice_items = items[(page-1)*PAGE:page*PAGE]
-            kb = page_kb(slice_items, page, total, "open")
+            kb = page_kb(slice_items, page, total, open_action)
             try:
                 bot.edit_message_reply_markup(uid, c.message.message_id, reply_markup=kb)
             except Exception:
                 pass
             bot.answer_callback_query(c.id); return
-        if a=="done":
+        if a == "t_done":
             tid = int(data.get("id"))
             t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
-            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            if not t:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
             deps = sess.query(Dependency).filter(Dependency.task_id==t.id).all()
             if deps:
                 undone = sess.query(Task).filter(Task.id.in_([d.depends_on_id for d in deps]),
@@ -882,38 +900,106 @@ def cb(c):
                 created = plan_next(sess, uid, sup, t.category, t.subcategory)
                 if created: msg += " Запланирована приемка/следующий заказ."
             bot.answer_callback_query(c.id, msg, show_alert=True); return
-        if a=="del":
+        if a == "t_del":
             tid = int(data.get("id"))
             t = sess.query(Task).filter(Task.id==tid, Task.user_id==uid).first()
-            if not t: bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            if not t:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
             sess.delete(t); sess.commit()
             bot.answer_callback_query(c.id, "Удалено", show_alert=True); return
-        if a=="setdl":
+        if a == "t_setdl":
             tid = int(data.get("id"))
             bot.answer_callback_query(c.id)
             sent = bot.send_message(uid, "Введи время в формате ЧЧ:ММ")
             bot.register_next_step_handler(sent, set_deadline_text, tid)
             return
-        if a=="rem":
+        if a == "t_rem":
             tid = int(data.get("id"))
             bot.answer_callback_query(c.id)
             sent = bot.send_message(uid, "Введи напоминание: ДД.ММ.ГГГГ ЧЧ:ММ")
             bot.register_next_step_handler(sent, add_reminder_text, tid)
             return
-        if a=="sub":
+        if a == "t_subadd":
             tid = int(data.get("id"))
             bot.answer_callback_query(c.id)
             sent = bot.send_message(uid, "Текст подзадачи:")
             bot.register_next_step_handler(sent, add_subtask_text, tid)
             return
-        if a=="dlg":
+        if a == "t_dlg":
             tid = int(data.get("id"))
             bot.answer_callback_query(c.id)
             sent = bot.send_message(uid, "Кому делегировать? Введи chat_id получателя.")
             bot.register_next_step_handler(sent, delegate_to_user, tid)
             return
+        if a == "t_back":
+            bot.answer_callback_query(c.id)
+            send_tasks_for_day(uid, now_local().date())
+            return
     finally:
         sess.close()
+
+@bot.callback_query_handler(func=lambda c: c.data and parse_cb(c.data) and parse_cb(c.data).get("a","").startswith("s_"))
+def subtasks_callbacks(c):
+    data = parse_cb(c.data)
+    uid = c.message.chat.id
+    a = data.get("a")
+    sess = SessionLocal()
+    try:
+        if a == "s_open":
+            sid = int(data.get("id")); pid = int(data.get("pid"))
+            st = sess.query(Subtask).filter(Subtask.id==sid).first()
+            if not st:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            text = f"<b>{st.text}</b>\nСтатус: {st.status or '—'}"
+            kb = types.InlineKeyboardMarkup()
+            if st.status == "выполнено":
+                kb.add(types.InlineKeyboardButton("↩️ Не выполнено", callback_data=mk_cb("s_undone", id=sid, pid=pid)))
+            else:
+                kb.add(types.InlineKeyboardButton("✅ Выполнить", callback_data=mk_cb("s_done", id=sid, pid=pid)))
+            kb.add(types.InlineKeyboardButton("🗑 Удалить", callback_data=mk_cb("s_del", id=sid, pid=pid)))
+            kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=mk_cb("t_open", id=pid)))
+            bot.answer_callback_query(c.id)
+            bot.send_message(uid, text, reply_markup=kb)
+            return
+        if a == "s_done":
+            sid = int(data.get("id")); pid = int(data.get("pid"))
+            st = sess.query(Subtask).filter(Subtask.id==sid).first()
+            if not st:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            st.status = "выполнено"; sess.commit()
+            bot.answer_callback_query(c.id, "Готово")
+            t = sess.query(Task).filter(Task.id==pid, Task.user_id==uid).first()
+            if t: send_task_card(uid, t, sess)
+            return
+        if a == "s_undone":
+            sid = int(data.get("id")); pid = int(data.get("pid"))
+            st = sess.query(Subtask).filter(Subtask.id==sid).first()
+            if not st:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            st.status = ""; sess.commit()
+            bot.answer_callback_query(c.id, "Возвращено")
+            t = sess.query(Task).filter(Task.id==pid, Task.user_id==uid).first()
+            if t: send_task_card(uid, t, sess)
+            return
+        if a == "s_del":
+            sid = int(data.get("id")); pid = int(data.get("pid"))
+            st = sess.query(Subtask).filter(Subtask.id==sid).first()
+            if not st:
+                bot.answer_callback_query(c.id, "Не найдено", show_alert=True); return
+            sess.delete(st); sess.commit()
+            bot.answer_callback_query(c.id, "Удалено")
+            t = sess.query(Task).filter(Task.id==pid, Task.user_id==uid).first()
+            if t: send_task_card(uid, t, sess)
+            return
+    finally:
+        sess.close()
+
+@bot.callback_query_handler(func=lambda c: c.data == "noop")
+def cb_noop(c):
+    try:
+        bot.answer_callback_query(c.id)
+    except Exception:
+        pass
 
 def set_deadline_text(m, tid):
     sess = SessionLocal()
@@ -1189,11 +1275,11 @@ def r_wiz_save(uid, chat_id):
         sess.close()
     r_wiz_reset(uid)
 
-@bot.callback_query_handler(func=lambda c: c.data and parse_cb(c.data) and parse_cb(c.data).get("a","").startswith("r_") or c.data in ("noop",))
+@bot.callback_query_handler(func=lambda c: c.data and parse_cb(c.data) and parse_cb(c.data).get("a","").startswith("r_"))
 def rules_callbacks(c):
     uid = c.from_user.id
     chat_id = c.message.chat.id
-    data = parse_cb(c.data) if c.data!="noop" else None
+    data = parse_cb(c.data)
     if not data:
         bot.answer_callback_query(c.id); return
     a = data.get("a")
