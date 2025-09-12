@@ -42,3 +42,15 @@ bash scripts/set_webhook.sh
 docker compose logs -f app
 docker compose up -d --build
 ```
+
+### Development
+
+В репо добавлен простой `Makefile`:
+
+```bash
+make fmt   # форматирование (black)
+make lint  # статический анализ (ruff)
+make test  # pytest с покрытием
+```
+
+Конфиги инструментов находятся в `pyproject.toml`.
