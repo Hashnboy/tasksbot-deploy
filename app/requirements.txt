@@ -13,3 +13,6 @@ psycopg2-binary>=2.9
 gunicorn>=23.0
 
 
+
+alembic>=1.13
+pytest>=8.0.0
