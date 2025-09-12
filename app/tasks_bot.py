@@ -156,6 +156,7 @@ class Rule(Base):
     created_at = Column(DateTime, server_default=func.now())
     __table_args__ = (Index("idx_rules_user_active", "user_id", "active"),)
 
+import app.penalties.models as pm
 Base.metadata.create_all(bind=engine)
 
 def migrate_db():
@@ -209,7 +210,8 @@ BEGIN
   END IF;
 END $$;
 """)
-migrate_db()
+if not DB_URL.startswith("sqlite"):
+    migrate_db()
 
 # --------- BOT ---------
 bot = TeleBot(API_TOKEN, parse_mode="HTML")
@@ -217,11 +219,13 @@ from org_ext import OrgExt
 from ops_ext import OpsExt
 
 org = OrgExt(bot)   # можно передать свой engine/SessionLocal, если у тебя уже есть
-org.init_db()       # создаст таблицы org_, точки и отчётные шаблоны
+if not DB_URL.startswith("sqlite"):
+    org.init_db()       # создаст таблицы org_, точки и отчётные шаблоны
+    ops = OpsExt(bot)   # контур перемещений
+    ops.init_db()       # создаст таблицы ops_
+else:
+    ops = OpsExt(bot)
 org.register()      # зарегистрирует хендлеры /start, /join, отчётность, чек-ин/аут, админ-меню
-
-ops = OpsExt(bot)   # контур перемещений
-ops.init_db()       # создаст таблицы ops_
 ops.register()      # зарегистрирует /ops и всё по перемещениям
 
 PAGE = 8  # повесит хендлеры: приглашения/роли, чек-ин/аут, отчёты, настройки, статистика
@@ -424,6 +428,7 @@ def main_menu():
     kb.row("📅 Сегодня","📆 Неделя")
     kb.row("➕ Добавить","✅ Я сделал…","🧠 Ассистент")
     kb.row("🚚 Поставки","🔎 Найти")
+    kb.row("⚖️ Контроль и штрафы")
     kb.row("⚙️ Правила","👤 Профиль","🧩 Зависимости","🤝 Делегирование")
     return kb
 
@@ -641,6 +646,68 @@ def add_supplier_parse(m):
         bot.send_message(m.chat.id, "✅ Поставщик сохранён.", reply_markup=main_menu())
     finally:
         sess.close()
+
+# ----- Контроль и штрафы -----
+@bot.message_handler(func=lambda msg: msg.text == "⚖️ Контроль и штрафы")
+def penalties_menu(m):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("Мои штрафы и баллы")
+    kb.row("Правила (политики)")
+    kb.row("Мои предупреждения/эскалации")
+    kb.row("⬅️ Назад")
+    bot.send_message(m.chat.id, "Раздел контроля и штрафов:", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: msg.text == "Мои штрафы и баллы")
+def penalties_list(m):
+    sess = SessionLocal()
+    try:
+        rows = (sess.query(pm.PenaltyLedger)
+                .join(pm.PenaltyEvent)
+                .filter(pm.PenaltyLedger.user_id==m.chat.id)
+                .order_by(pm.PenaltyLedger.applied_at.desc())
+                .limit(10).all())
+        if not rows:
+            kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+            kb.row("⬅️ Назад")
+            bot.send_message(m.chat.id, "Штрафов нет.", reply_markup=kb)
+            return
+        lines=[]
+        for r in rows:
+            amt = f" / {r.amount} ₽" if r.amount else ""
+            lines.append(f"{r.applied_at.date()} • {r.points} баллов{amt} — {', '.join(r.reasons or [])}")
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row("⬅️ Назад")
+        bot.send_message(m.chat.id, "\n".join(lines), reply_markup=kb)
+    finally:
+        sess.close()
+
+@bot.message_handler(func=lambda msg: msg.text == "Правила (политики)")
+def policies_view(m):
+    sess = SessionLocal()
+    try:
+        pol = (sess.query(pm.PenaltyPolicy)
+               .filter(pm.PenaltyPolicy.is_active==True)
+               .all())
+        if not pol:
+            kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+            kb.row("⬅️ Назад")
+            bot.send_message(m.chat.id, "Активных политик нет.", reply_markup=kb)
+            return
+        lines=[]
+        for p in pol:
+            first = p.rules[0]["when"] if p.rules else "—"
+            lines.append(f"{p.name}: {first}")
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row("⬅️ Назад")
+        bot.send_message(m.chat.id, "\n".join(lines), reply_markup=kb)
+    finally:
+        sess.close()
+
+@bot.message_handler(func=lambda msg: msg.text == "Мои предупреждения/эскалации")
+def my_escalations(m):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("⬅️ Назад")
+    bot.send_message(m.chat.id, "Пока предупреждений нет.", reply_markup=kb)
 
 # ----- Поиск / Ассистент -----
 @bot.message_handler(func=lambda msg: msg.text == "🔎 Найти")

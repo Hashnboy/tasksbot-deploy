@@ -18,6 +18,10 @@ cp env/.env.example .env
 nano .env
 ```
 Заполни: `TELEGRAM_TOKEN`, `DATABASE_URL`, `OPENAI_API_KEY (опц.)`.
+Также доступны настройки контроля и штрафов:
+`POLICY_DEFAULT_STRICTNESS`, `POLICY_TIMEZONE`, `PENALTY_MAX_DAILY_POINTS`,
+`PENALTY_MAX_MONTH_AMOUNT`, `APPEALS_ALLOWED_DAYS`,
+`ESCALATION_NOTIFY_TELEGRAM_IDS`, `PROBATION_DEFAULT_DAYS`.
 `WEBHOOK_BASE` уже выставлен на `https://bottg.online` (можешь поменять).
 
 ### 3) Запуск
